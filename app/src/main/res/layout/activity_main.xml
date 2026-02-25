@@ -24,14 +24,15 @@
         <androidx.camera.view.PreviewView
             android:id="@+id/viewFinder"
             android:layout_width="match_parent"
-            android:layout_height="match_parent" />
+            android:layout_height="match_parent"
+            app:scaleType="fillCenter" />
 
         <!-- Processed Frame Overlay -->
         <ImageView
             android:id="@+id/processedOverlay"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:scaleType="fitCenter"
+            android:scaleType="centerCrop"
             android:adjustViewBounds="true" />
 
     </FrameLayout>
