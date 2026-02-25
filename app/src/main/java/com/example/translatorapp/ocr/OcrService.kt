@@ -1,5 +1,6 @@
 package com.example.translatorapp.ocr
 
+import android.graphics.Bitmap
 import android.graphics.Rect
 import android.util.Log
 import androidx.annotation.OptIn
@@ -17,8 +18,11 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import org.opencv.android.Utils
-import org.opencv.core.Mat
 import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 import kotlin.coroutines.resumeWithException
 
 class OcrService : ImageAnalysis.Analyzer {
@@ -27,6 +31,7 @@ class OcrService : ImageAnalysis.Analyzer {
         val language: String,
         val text: String,
         val boundingBox: Rect?,
+        val cornerPoints: Array<android.graphics.Point>? = null,
         val roiMat: Mat? = null
     )
 
@@ -39,17 +44,29 @@ class OcrService : ImageAnalysis.Analyzer {
 
     private val _detections = MutableSharedFlow<List<DetectionResult>>()
     val detections: SharedFlow<List<DetectionResult>> = _detections.asSharedFlow()
+    private val _motionStable = MutableSharedFlow<Boolean>(replay = 1)
+    val motionStable: SharedFlow<Boolean> = _motionStable.asSharedFlow()
 
     private val seenBoxes = mutableListOf<Rect>()
     private val scope = CoroutineScope(Dispatchers.Default)
+    private var prevGraySmall: Mat? = null
+    private var lastMotionTimeMs = 0L
+    private var unstableSinceMs = 0L
+    private var lastStableState: Boolean? = null
+    @Volatile private var ocrArmed = true
+    @Volatile private var ocrInFlight = false
+    private var preferredRecognizer = "latin"
+    var ocrBurstFrames = 1
+    private var ocrFramesProcessed = 0
+    var recognizerTimeoutMs = 700L
+
+    var motionThreshold = 12.0
+    var stableHoldMs = 2000L
+    var unstableHoldMs = 1500L
+    var hardMotionThreshold = 22.0
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
-        val mediaImage = imageProxy.image ?: run {
-            imageProxy.close()
-            return
-        }
-
         var fullMat = imageProxy.toMat() ?: run {
             imageProxy.close()
             return
@@ -59,15 +76,47 @@ class OcrService : ImageAnalysis.Analyzer {
         val rotation = imageProxy.imageInfo.rotationDegrees
         fullMat = rotateMat(fullMat, rotation)
 
-        val image = InputImage.fromMediaImage(mediaImage, rotation)
+        // Always publish the latest raw camera frame
+        FrameOcrRepository.updateLatestCameraFrame(fullMat)
+
+        val isStable = updateMotionState(fullMat)
+        emitMotionState(isStable)
+        if (!isStable) {
+            fullMat.release()
+            imageProxy.close()
+            return
+        }
+        if (!ocrArmed) {
+            fullMat.release()
+            imageProxy.close()
+            return
+        }
+        if (ocrInFlight) {
+            fullMat.release()
+            imageProxy.close()
+            return
+        }
+
+        val bitmap = matToBitmap(fullMat) ?: run {
+            fullMat.release()
+            imageProxy.close()
+            return
+        }
+        val image = InputImage.fromBitmap(bitmap, 0)
+        ocrInFlight = true
+        fullMat.release()
+        imageProxy.close()
 
         scope.launch {
             try {
                 val results = mutableListOf<DetectionResult>()
 
-                for ((lang, recognizer) in recognizers) {
+                val orderedRecognizers = buildRecognizerOrder()
+                for (lang in orderedRecognizers) {
+                    val recognizer = recognizers[lang] ?: continue
+                    var recognizerFoundText = false
                     try {
-                        val textResult = withTimeout(1000L) {
+                        val textResult = withTimeout(recognizerTimeoutMs) {
                             recognizer.process(image).await()
                         }
 
@@ -76,15 +125,15 @@ class OcrService : ImageAnalysis.Analyzer {
                                 val box = line.boundingBox ?: continue
                                 if (isDuplicateBox(box)) continue
 
-                                val roiMat = extractRoiMat(fullMat, box)
                                 seenBoxes.add(box)
+                                recognizerFoundText = true
 
                                 results.add(
                                     DetectionResult(
                                         language = lang,
                                         text = line.text,
                                         boundingBox = box,
-                                        roiMat = roiMat
+                                        cornerPoints = line.cornerPoints
                                     )
                                 )
                             }
@@ -93,6 +142,11 @@ class OcrService : ImageAnalysis.Analyzer {
                     } catch (e: Exception) {
                         Log.e("OCR", "Recognizer $lang failed", e)
                     }
+
+                    if (recognizerFoundText) {
+                        preferredRecognizer = lang
+                        break
+                    }
                 }
 
                 if (results.isNotEmpty()) {
@@ -100,18 +154,122 @@ class OcrService : ImageAnalysis.Analyzer {
                     Log.d("OCR", "Detected ${results.size} text lines")
 
                     // Update shared repository
-                    FrameOcrRepository.updateFrame(fullMat)
                     FrameOcrRepository.updateDetections(results)
+                    ocrFramesProcessed++
+                    if (ocrFramesProcessed >= ocrBurstFrames) {
+                        ocrArmed = false
+                    }
                 }
 
             } catch (e: Exception) {
                 Log.e("OCR", "Error in analysis", e)
             } finally {
-                fullMat.release()
-                imageProxy.close()
+                bitmap.recycle()
+                ocrInFlight = false
             }
         }
     }
+
+    private fun buildRecognizerOrder(): List<String> {
+        if (!recognizers.containsKey(preferredRecognizer)) {
+            preferredRecognizer = "latin"
+        }
+        val ordered = ArrayList<String>(recognizers.size)
+        ordered.add(preferredRecognizer)
+        recognizers.keys.forEach { key ->
+            if (key != preferredRecognizer) {
+                ordered.add(key)
+            }
+        }
+        return ordered
+    }
+
+    private fun matToBitmap(frame: Mat): Bitmap? {
+        if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) return null
+
+        return try {
+            val bitmap = Bitmap.createBitmap(frame.cols(), frame.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(frame, bitmap)
+            bitmap
+        } catch (e: Exception) {
+            Log.e("OCR", "Failed to convert Mat to Bitmap for OCR", e)
+            null
+        }
+    }
+
+    private fun updateMotionState(frame: Mat): Boolean {
+        val now = System.currentTimeMillis()
+
+        val gray = Mat()
+        when (frame.channels()) {
+            4 -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_RGBA2GRAY)
+            3 -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY)
+            1 -> frame.copyTo(gray)
+            else -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY)
+        }
+
+        val small = Mat()
+        Imgproc.resize(gray, small, Size(160.0, 120.0))
+        gray.release()
+
+        val prev = prevGraySmall
+        if (prev == null || prev.empty()) {
+            prevGraySmall?.release()
+            prevGraySmall = small.clone()
+            small.release()
+            lastMotionTimeMs = now
+            return false
+        }
+
+        val diff = Mat()
+        Core.absdiff(prev, small, diff)
+        val mean = Core.mean(diff)
+        diff.release()
+
+        val motion = mean.`val`[0]
+        if (motion > hardMotionThreshold) {
+            lastMotionTimeMs = now
+            unstableSinceMs = now - unstableHoldMs
+            seenBoxes.clear()
+        } else if (motion > motionThreshold) {
+            lastMotionTimeMs = now
+            if (unstableSinceMs == 0L) unstableSinceMs = now
+        } else {
+            unstableSinceMs = 0L
+        }
+
+        prev.release()
+        prevGraySmall = small.clone()
+        small.release()
+
+        val stableEnough = (now - lastMotionTimeMs) >= stableHoldMs
+        val unstableEnough = unstableSinceMs != 0L && (now - unstableSinceMs) >= unstableHoldMs
+
+        val stable = when {
+            unstableEnough -> false
+            stableEnough -> true
+            else -> (lastStableState == true)
+        }
+        if (!stable && lastStableState == true) {
+            // Only reset OCR when we truly transitioned to unstable
+            ocrArmed = true
+            ocrFramesProcessed = 0
+            seenBoxes.clear()
+            preferredRecognizer = "latin"
+        }
+        return stable
+    }
+
+    // Sharpness gating removed; stability timing handles blur.
+
+    private fun emitMotionState(stable: Boolean) {
+        if (lastStableState == stable) return
+        lastStableState = stable
+        scope.launch {
+            _motionStable.emit(stable)
+        }
+    }
+
     private fun isDuplicateBox(box: Rect): Boolean {
         return seenBoxes.any { existingBox ->
             kotlin.math.abs(existingBox.top - box.top) <= 2 &&
@@ -130,25 +288,8 @@ class OcrService : ImageAnalysis.Analyzer {
             270 -> Core.rotate(src, dst, Core.ROTATE_90_COUNTERCLOCKWISE)
             else -> return src
         }
+        src.release()
         return dst
-    }
-
-
-    private fun extractRoiMat(fullMat: Mat, boundingBox: Rect): Mat? {
-        return try {
-            val x = boundingBox.left.coerceIn(0, fullMat.cols() - 1)
-            val y = boundingBox.top.coerceIn(0, fullMat.rows() - 1)
-            val width = boundingBox.width().coerceAtMost(fullMat.cols() - x)
-            val height = boundingBox.height().coerceAtMost(fullMat.rows() - y)
-
-            if (width > 0 && height > 0) {
-                val roi = Mat(fullMat, org.opencv.core.Rect(x, y, width, height))
-                roi.clone()
-            } else null
-        } catch (e: Exception) {
-            Log.e("OCR", "ROI Extraction Failed", e)
-            null
-        }
     }
     fun resetCache() {
         seenBoxes.clear()
@@ -156,50 +297,84 @@ class OcrService : ImageAnalysis.Analyzer {
 
     fun cleanup() {
         scope.cancel()
+        prevGraySmall?.release()
+        prevGraySmall = null
     }
 }
 
 @OptIn(ExperimentalGetImage::class)
 fun ImageProxy.toMat(): Mat? {
-    val mediaImage = this.image ?: return null
+    if (this.format != android.graphics.ImageFormat.YUV_420_888) return null
 
-    val yBuffer = mediaImage.planes[0].buffer
-    val uBuffer = mediaImage.planes[1].buffer
-    val vBuffer = mediaImage.planes[2].buffer
+    val nv21 = yuv420ToNv21(this)
+    val yuv = Mat(this.height + this.height / 2, this.width, CvType.CV_8UC1)
+    yuv.put(0, 0, nv21)
 
-    val ySize = yBuffer.remaining()
-    val uSize = uBuffer.remaining()
-    val vSize = vBuffer.remaining()
+    val rgba = Mat()
+    Imgproc.cvtColor(yuv, rgba, Imgproc.COLOR_YUV2RGBA_NV21, 4)
+    yuv.release()
 
-    val nv21 = ByteArray(ySize + uSize + vSize)
+    return rgba
+}
 
-    yBuffer.get(nv21, 0, ySize)
-    vBuffer.get(nv21, ySize, vSize)
-    uBuffer.get(nv21, ySize + vSize, uSize)
+private fun yuv420ToNv21(image: ImageProxy): ByteArray {
+    val width = image.width
+    val height = image.height
+    val ySize = width * height
+    val uvSize = width * height / 4
+    val out = ByteArray(ySize + uvSize * 2)
 
-    val yuvImage = android.graphics.YuvImage(
-        nv21,
-        android.graphics.ImageFormat.NV21,
-        mediaImage.width,
-        mediaImage.height,
-        null
-    )
+    copyPlane(image.planes[0], width, height, out, 0, 1)
+    copyPlane(image.planes[2], width / 2, height / 2, out, ySize, 2)
+    copyPlane(image.planes[1], width / 2, height / 2, out, ySize + 1, 2)
 
-    val out = java.io.ByteArrayOutputStream()
-    yuvImage.compressToJpeg(
-        android.graphics.Rect(0, 0, mediaImage.width, mediaImage.height),
-        90,
-        out
-    )
+    return out
+}
 
-    val bytes = out.toByteArray()
-    val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+private fun copyPlane(
+    plane: ImageProxy.PlaneProxy,
+    width: Int,
+    height: Int,
+    out: ByteArray,
+    offset: Int,
+    outputStride: Int
+) {
+    val buffer = plane.buffer
+    buffer.rewind()
 
-    val mat = Mat()
-    org.opencv.android.Utils.bitmapToMat(bitmap, mat)
-    bitmap.recycle()
+    val rowStride = plane.rowStride
+    val pixelStride = plane.pixelStride
+    val rowData = ByteArray(rowStride)
+    var outputPos = offset
 
-    return mat
+    for (row in 0 until height) {
+        val bytesToRead = if (pixelStride == 1 && outputStride == 1) {
+            width
+        } else {
+            (width - 1) * pixelStride + 1
+        }
+
+        buffer.get(rowData, 0, bytesToRead)
+
+        if (pixelStride == 1 && outputStride == 1) {
+            System.arraycopy(rowData, 0, out, outputPos, width)
+            outputPos += width
+        } else {
+            var inputPos = 0
+            repeat(width) {
+                out[outputPos] = rowData[inputPos]
+                outputPos += outputStride
+                inputPos += pixelStride
+            }
+        }
+
+        if (row < height - 1) {
+            val skip = rowStride - bytesToRead
+            if (skip > 0) {
+                buffer.position(buffer.position() + skip)
+            }
+        }
+    }
 }
 
 suspend fun <T> com.google.android.gms.tasks.Task<T>.await(): T {
