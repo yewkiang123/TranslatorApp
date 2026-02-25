@@ -22,6 +22,7 @@ class CameraController(
     private val viewBinding: ActivityMainBinding
 ) {
     private val fileFormat = "yyyy-MM-dd-HH-mm-ss-SSS"
+    private var cameraProvider: ProcessCameraProvider? = null
     private var imageCapture: ImageCapture? = null
     private var imageAnalysis: ImageAnalysis? = null
 
@@ -29,7 +30,8 @@ class CameraController(
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
 
         cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
+            val boundCameraProvider = cameraProviderFuture.get()
+            cameraProvider = boundCameraProvider
 
             // Preview
             val preview = Preview.Builder().build().also {
@@ -54,7 +56,7 @@ class CameraController(
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
-                cameraProvider.unbindAll()
+                boundCameraProvider.unbindAll()
 
                 // Bind use cases
                 val useCases = mutableListOf<UseCase>(preview)
@@ -62,7 +64,7 @@ class CameraController(
                     useCases.add(imageAnalysis!!)
                 }
 
-                cameraProvider.bindToLifecycle(
+                boundCameraProvider.bindToLifecycle(
                     lifecycleOwner, cameraSelector,
                     *useCases.toTypedArray()
                 )
@@ -71,6 +73,15 @@ class CameraController(
             }
 
         }, ContextCompat.getMainExecutor(context))
+    }
+
+    fun stopCamera() {
+        try {
+            imageAnalysis?.clearAnalyzer()
+            cameraProvider?.unbindAll()
+        } catch (e: Exception) {
+            Log.e("CAMERA", "Failed to stop camera", e)
+        }
     }
 
     fun takePhoto() {

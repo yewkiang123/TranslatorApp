@@ -56,14 +56,14 @@ class OcrService : ImageAnalysis.Analyzer {
     @Volatile private var ocrArmed = true
     @Volatile private var ocrInFlight = false
     private var preferredRecognizer = "latin"
-    var ocrBurstFrames = 1
+    var ocrBurstFrames = 2
     private var ocrFramesProcessed = 0
-    var recognizerTimeoutMs = 700L
+    var recognizerTimeoutMs = 900L
 
-    var motionThreshold = 12.0
-    var stableHoldMs = 2000L
-    var unstableHoldMs = 1500L
-    var hardMotionThreshold = 22.0
+    var motionThreshold = 10.5
+    var stableHoldMs = 1200L
+    var unstableHoldMs = 1000L
+    var hardMotionThreshold = 19.0
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {

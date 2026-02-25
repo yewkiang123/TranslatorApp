@@ -10,12 +10,13 @@ import androidx.core.graphics.createBitmap
 import org.opencv.android.Utils
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
 import org.opencv.core.Point
 import org.opencv.core.Scalar
 import org.opencv.imgproc.Imgproc
-import org.opencv.photo.Photo
+import kotlin.math.abs
 import kotlin.math.atan2
-import kotlin.math.sqrt
+import kotlin.math.roundToInt
 
 class SceneTextReplacer(
     private val typeface: Typeface = Typeface.DEFAULT_BOLD
@@ -23,14 +24,17 @@ class SceneTextReplacer(
 
     companion object {
         private const val TAG = "SceneTextReplacer"
-        private const val GENERATED_TEXT_SCALE = 0.7f
+        private const val GENERATED_TEXT_SCALE = 0.8f
+        private const val ANGLE_SNAP_DEGREES = 1.25f
+        private const val MIN_TEXT_BACKGROUND_DISTANCE = 48.0
     }
 
     private data class DrawItem(
         val result: OcrService.DetectionResult,
         val box: android.graphics.Rect,
         val text: String,
-        val color: Int
+        val color: Int,
+        val backgroundColor: Int
     )
 
     private data class RgbColor(
@@ -39,13 +43,15 @@ class SceneTextReplacer(
         val b: Double
     )
 
-    private var reusableMask: Mat? = null
     private var reusableBitmap: Bitmap? = null
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
         this.typeface = this@SceneTextReplacer.typeface
         style = Paint.Style.FILL
         isFakeBoldText = true
+        isSubpixelText = true
+        isLinearText = true
+        hinting = Paint.HINTING_ON
     }
     private val textBounds = android.graphics.Rect()
 
@@ -66,19 +72,26 @@ class SceneTextReplacer(
                 return working
             }
 
-            val mask = getOrCreateMask(working.cols(), working.rows())
-            mask.setTo(Scalar(0.0))
             drawItems.forEach { item ->
-                Imgproc.rectangle(
-                    mask,
-                    Point(item.box.left.toDouble(), item.box.top.toDouble()),
-                    Point(item.box.right.toDouble(), item.box.bottom.toDouble()),
-                    Scalar(255.0),
-                    -1
-                )
+                val fillColor = toBgrScalar(item.backgroundColor)
+                val polygon = toClampedPolygon(item.result.cornerPoints, working.cols(), working.rows())
+                if (polygon != null) {
+                    Imgproc.fillConvexPoly(working, polygon, fillColor)
+                    polygon.release()
+                } else {
+                    val left = item.box.left.coerceAtLeast(0)
+                    val top = item.box.top.coerceAtLeast(0)
+                    val right = item.box.right.coerceAtMost(working.cols())
+                    val bottom = item.box.bottom.coerceAtMost(working.rows())
+                    Imgproc.rectangle(
+                        working,
+                        Point(left.toDouble(), top.toDouble()),
+                        Point(right.toDouble(), bottom.toDouble()),
+                        fillColor,
+                        -1
+                    )
+                }
             }
-
-            Photo.inpaint(working, mask, working, 3.0, Photo.INPAINT_TELEA)
 
             Imgproc.cvtColor(working, working, Imgproc.COLOR_BGR2RGB)
             val bitmap = getOrCreateBitmap(working.cols(), working.rows())
@@ -93,41 +106,6 @@ class SceneTextReplacer(
             Imgproc.cvtColor(working, working, Imgproc.COLOR_RGB2BGR)
         } catch (e: Exception) {
             Log.e(TAG, "SceneTextReplacer failed", e)
-        }
-
-        return working
-    }
-
-    fun drawTextOnly(
-        frame: Mat,
-        detectionResults: List<OcrService.DetectionResult>,
-        translatedTexts: List<String>
-    ): Mat {
-        if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) {
-            return frame
-        }
-
-        val working = ensureBgr(frame)
-
-        try {
-            val drawItems = collectDrawItems(working, detectionResults, translatedTexts)
-            if (drawItems.isEmpty()) {
-                return working
-            }
-
-            Imgproc.cvtColor(working, working, Imgproc.COLOR_BGR2RGB)
-            val bitmap = getOrCreateBitmap(working.cols(), working.rows())
-            Utils.matToBitmap(working, bitmap)
-            val canvas = Canvas(bitmap)
-
-            drawItems.forEach { item ->
-                drawTranslatedText(canvas, working.cols(), working.rows(), item)
-            }
-
-            Utils.bitmapToMat(bitmap, working)
-            Imgproc.cvtColor(working, working, Imgproc.COLOR_RGB2BGR)
-        } catch (e: Exception) {
-            Log.e(TAG, "drawTextOnly failed", e)
         }
 
         return working
@@ -154,10 +132,190 @@ class SceneTextReplacer(
             val text = translatedTexts.getOrNull(index)?.trim().orEmpty()
             val box = result.boundingBox ?: return@forEachIndexed
             if (text.isEmpty()) return@forEachIndexed
-            val color = estimateTextColor(sourceBgr, box)
-            items.add(DrawItem(result, box, text, color))
+            val backgroundColor = estimateBackgroundColor(sourceBgr, box)
+            val rawTextColor = estimateTextColor(sourceBgr, box)
+            val finalTextColor = enforceTextContrast(rawTextColor, backgroundColor)
+            items.add(DrawItem(result, box, text, finalTextColor, backgroundColor))
         }
         return items
+    }
+
+    private fun enforceTextContrast(textColor: Int, backgroundColor: Int): Int {
+        val distance = colorDistance(textColor, backgroundColor)
+        if (distance >= MIN_TEXT_BACKGROUND_DISTANCE) return textColor
+
+        val bgLuma = luminance(backgroundColor)
+        return if (bgLuma >= 140.0) {
+            Color.rgb(20, 20, 20)
+        } else {
+            Color.rgb(235, 235, 235)
+        }
+    }
+
+    private fun luminance(color: Int): Double {
+        return (0.299 * Color.red(color)) +
+            (0.587 * Color.green(color)) +
+            (0.114 * Color.blue(color))
+    }
+
+    private fun colorDistance(a: Int, b: Int): Double {
+        val dr = (Color.red(a) - Color.red(b)).toDouble()
+        val dg = (Color.green(a) - Color.green(b)).toDouble()
+        val db = (Color.blue(a) - Color.blue(b)).toDouble()
+        return kotlin.math.sqrt(dr * dr + dg * dg + db * db)
+    }
+
+    private fun estimateBackgroundColor(sourceBgr: Mat, box: android.graphics.Rect): Int {
+        val x1 = box.left.coerceAtLeast(0)
+        val y1 = box.top.coerceAtLeast(0)
+        val x2 = box.right.coerceAtMost(sourceBgr.cols())
+        val y2 = box.bottom.coerceAtMost(sourceBgr.rows())
+        val width = x2 - x1
+        val height = y2 - y1
+        if (width <= 1 || height <= 1) return Color.WHITE
+
+        // Use only pixels inside the bounding box:
+        // majority cluster (dark/light) is treated as background color.
+        val area = width * height
+        val sampleStep = when {
+            area > 40_000 -> 4
+            area > 12_000 -> 3
+            area > 4_000 -> 2
+            else -> 1
+        }
+
+        var darkR = 0.0
+        var darkG = 0.0
+        var darkB = 0.0
+        var darkCount = 0
+
+        var lightR = 0.0
+        var lightG = 0.0
+        var lightB = 0.0
+        var lightCount = 0
+
+        for (y in y1 until y2 step sampleStep) {
+            for (x in x1 until x2 step sampleStep) {
+                val bgr = sourceBgr.get(y, x) ?: continue
+                if (bgr.size < 3) continue
+
+                val b = bgr[0]
+                val g = bgr[1]
+                val r = bgr[2]
+                val lum = 0.114 * b + 0.587 * g + 0.299 * r
+
+                if (lum < 128.0) {
+                    darkR += r
+                    darkG += g
+                    darkB += b
+                    darkCount++
+                } else {
+                    lightR += r
+                    lightG += g
+                    lightB += b
+                    lightCount++
+                }
+            }
+        }
+
+        if (darkCount == 0 && lightCount == 0) {
+            return averageColorInRect(sourceBgr, x1, y1, x2, y2)
+        }
+
+        if (darkCount == 0) {
+            return Color.rgb(
+                (lightR / lightCount).toInt().coerceIn(0, 255),
+                (lightG / lightCount).toInt().coerceIn(0, 255),
+                (lightB / lightCount).toInt().coerceIn(0, 255)
+            )
+        }
+
+        if (lightCount == 0) {
+            return Color.rgb(
+                (darkR / darkCount).toInt().coerceIn(0, 255),
+                (darkG / darkCount).toInt().coerceIn(0, 255),
+                (darkB / darkCount).toInt().coerceIn(0, 255)
+            )
+        }
+
+        val backgroundFromDark = darkCount >= lightCount
+        val selectedR = if (backgroundFromDark) darkR / darkCount else lightR / lightCount
+        val selectedG = if (backgroundFromDark) darkG / darkCount else lightG / lightCount
+        val selectedB = if (backgroundFromDark) darkB / darkCount else lightB / lightCount
+
+        return Color.rgb(
+            selectedR.toInt().coerceIn(0, 255),
+            selectedG.toInt().coerceIn(0, 255),
+            selectedB.toInt().coerceIn(0, 255)
+        )
+    }
+
+    private fun averageColorInRect(sourceBgr: Mat, x1: Int, y1: Int, x2: Int, y2: Int): Int {
+        val width = x2 - x1
+        val height = y2 - y1
+        if (width <= 0 || height <= 0) return Color.WHITE
+
+        val area = width * height
+        val sampleStep = when {
+            area > 40_000 -> 4
+            area > 12_000 -> 3
+            area > 4_000 -> 2
+            else -> 1
+        }
+
+        var sumR = 0.0
+        var sumG = 0.0
+        var sumB = 0.0
+        var count = 0
+
+        for (y in y1 until y2 step sampleStep) {
+            for (x in x1 until x2 step sampleStep) {
+                val bgr = sourceBgr.get(y, x) ?: continue
+                if (bgr.size < 3) continue
+                sumB += bgr[0]
+                sumG += bgr[1]
+                sumR += bgr[2]
+                count++
+            }
+        }
+
+        if (count == 0) return Color.WHITE
+
+        return Color.rgb(
+            (sumR / count).toInt().coerceIn(0, 255),
+            (sumG / count).toInt().coerceIn(0, 255),
+            (sumB / count).toInt().coerceIn(0, 255)
+        )
+    }
+
+    private fun toBgrScalar(color: Int): Scalar {
+        return Scalar(
+            Color.blue(color).toDouble(),
+            Color.green(color).toDouble(),
+            Color.red(color).toDouble()
+        )
+    }
+
+    private fun toClampedPolygon(
+        points: Array<android.graphics.Point>?,
+        maxWidth: Int,
+        maxHeight: Int
+    ): MatOfPoint? {
+        if (points == null || points.size < 3) return null
+
+        val maxX = (maxWidth - 1).coerceAtLeast(0).toDouble()
+        val maxY = (maxHeight - 1).coerceAtLeast(0).toDouble()
+        val clamped = points.map {
+            Point(
+                it.x.toDouble().coerceIn(0.0, maxX),
+                it.y.toDouble().coerceIn(0.0, maxY)
+            )
+        }
+
+        val unique = clamped.distinctBy { "${it.x.toInt()}_${it.y.toInt()}" }
+        if (unique.size < 3) return null
+
+        return MatOfPoint(*unique.toTypedArray())
     }
 
     private fun estimateTextColor(sourceBgr: Mat, box: android.graphics.Rect): Int {
@@ -177,36 +335,15 @@ class SceneTextReplacer(
             else -> 1
         }
 
-        val luminances = ArrayList<Double>()
-        for (y in y1 until y2 step sampleStep) {
-            for (x in x1 until x2 step sampleStep) {
-                val bgr = sourceBgr.get(y, x) ?: continue
-                if (bgr.size < 3) continue
-                val lum = 0.114 * bgr[0] + 0.587 * bgr[1] + 0.299 * bgr[2]
-                luminances.add(lum)
-            }
-        }
+        var darkR = 0.0
+        var darkG = 0.0
+        var darkB = 0.0
+        var darkCount = 0
 
-        if (luminances.size < 10) return Color.BLACK
-
-        val sortedLuma = luminances.sorted()
-        val lowThreshold = sortedLuma[((sortedLuma.size - 1) * 0.20).toInt()]
-        val highThreshold = sortedLuma[((sortedLuma.size - 1) * 0.80).toInt()]
-
-        var allR = 0.0
-        var allG = 0.0
-        var allB = 0.0
-        var allCount = 0
-
-        var lowR = 0.0
-        var lowG = 0.0
-        var lowB = 0.0
-        var lowCount = 0
-
-        var highR = 0.0
-        var highG = 0.0
-        var highB = 0.0
-        var highCount = 0
+        var lightR = 0.0
+        var lightG = 0.0
+        var lightB = 0.0
+        var lightCount = 0
 
         for (y in y1 until y2 step sampleStep) {
             for (x in x1 until x2 step sampleStep) {
@@ -218,55 +355,30 @@ class SceneTextReplacer(
                 val r = bgr[2]
                 val lum = 0.114 * b + 0.587 * g + 0.299 * r
 
-                allR += r
-                allG += g
-                allB += b
-                allCount++
-
-                if (lum <= lowThreshold) {
-                    lowR += r
-                    lowG += g
-                    lowB += b
-                    lowCount++
+                if (lum < 128.0) {
+                    darkR += r
+                    darkG += g
+                    darkB += b
+                    darkCount++
                 }
-                if (lum >= highThreshold) {
-                    highR += r
-                    highG += g
-                    highB += b
-                    highCount++
+                else {
+                    lightR += r
+                    lightG += g
+                    lightB += b
+                    lightCount++
                 }
             }
         }
 
-        if (allCount == 0) return Color.BLACK
+        if (darkCount == 0 && lightCount == 0) return Color.BLACK
+        if (darkCount == 0) return Color.rgb(20, 20, 20)
+        if (lightCount == 0) return Color.rgb(235, 235, 235)
 
-        val avg = RgbColor(
-            r = allR / allCount,
-            g = allG / allCount,
-            b = allB / allCount
-        )
-        val dark = if (lowCount > 0) {
-            RgbColor(r = lowR / lowCount, g = lowG / lowCount, b = lowB / lowCount)
+        val textFromDark = darkCount < lightCount
+        val selected = if (textFromDark) {
+            RgbColor(r = darkR / darkCount, g = darkG / darkCount, b = darkB / darkCount)
         } else {
-            avg
-        }
-        val light = if (highCount > 0) {
-            RgbColor(r = highR / highCount, g = highG / highCount, b = highB / highCount)
-        } else {
-            avg
-        }
-
-        val darkDistance = colorDistance(dark, avg)
-        val lightDistance = colorDistance(light, avg)
-        val selected = if (darkDistance >= lightDistance) dark else light
-        val selectedDistance = if (darkDistance >= lightDistance) darkDistance else lightDistance
-
-        if (selectedDistance < 18.0) {
-            return if (luminance(avg) > 150.0) {
-                Color.rgb(20, 20, 20)
-            } else {
-                Color.rgb(235, 235, 235)
-            }
+            RgbColor(r = lightR / lightCount, g = lightG / lightCount, b = lightB / lightCount)
         }
 
         return Color.rgb(
@@ -274,29 +386,6 @@ class SceneTextReplacer(
             selected.g.toInt().coerceIn(0, 255),
             selected.b.toInt().coerceIn(0, 255)
         )
-    }
-
-    private fun luminance(color: RgbColor): Double {
-        return 0.299 * color.r + 0.587 * color.g + 0.114 * color.b
-    }
-
-    private fun colorDistance(a: RgbColor, b: RgbColor): Double {
-        val dr = a.r - b.r
-        val dg = a.g - b.g
-        val db = a.b - b.b
-        return sqrt(dr * dr + dg * dg + db * db)
-    }
-
-    private fun getOrCreateMask(width: Int, height: Int): Mat {
-        val existing = reusableMask
-        if (existing != null && existing.cols() == width && existing.rows() == height) {
-            return existing
-        }
-
-        existing?.release()
-        val created = Mat.zeros(height, width, CvType.CV_8UC1)
-        reusableMask = created
-        return created
     }
 
     private fun getOrCreateBitmap(width: Int, height: Int): Bitmap {
@@ -342,11 +431,13 @@ class SceneTextReplacer(
 
         val centerX = x1 + boxWidth / 2f
         val centerY = y1 + boxHeight / 2f
-        val drawX = centerX - textPaint.measureText(item.text) / 2f
+        val drawX = (x1 - textBounds.left).toFloat()
         val fontMetrics = textPaint.fontMetrics
-        val drawY = centerY - (fontMetrics.ascent + fontMetrics.descent) / 2f
+        val drawY = (centerY - (fontMetrics.ascent + fontMetrics.descent) / 2f).roundToInt().toFloat()
 
-        val angle = computeTextAngle(item.result)
+        val angle = computeTextAngle(item.result).let { raw ->
+            if (abs(raw) < ANGLE_SNAP_DEGREES) 0f else raw
+        }
         if (angle != 0f) {
             canvas.save()
             canvas.rotate(angle, centerX, centerY)

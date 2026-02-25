@@ -1,18 +1,35 @@
 package com.example.translatorapp
 
 import android.Manifest
+import android.animation.Animator
+import android.animation.AnimatorSet
+import android.animation.ObjectAnimator
+import android.animation.PropertyValuesHolder
+import android.animation.ValueAnimator
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.GestureDetector
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewGroup
+import android.view.animation.LinearInterpolator
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.ImageButton
+import android.widget.ImageView
+import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.interpolator.view.animation.FastOutSlowInInterpolator
 import androidx.lifecycle.lifecycleScope
 import com.example.translatorapp.camera.CameraController
 import com.example.translatorapp.databinding.ActivityMainBinding
@@ -23,11 +40,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
-import java.io.File
-import java.io.FileOutputStream
 import java.util.Locale
 import java.util.concurrent.Executors
-import androidx.core.graphics.createBitmap
 import com.example.translatorapp.ocr.FrameOcrRepository
 import com.example.translatorapp.ocr.SceneTextReplacer
 import kotlinx.coroutines.Job
@@ -45,9 +59,15 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 
 
 class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
+    private data class LanguageOption(
+        val label: String,
+        val code: String
+    )
+
     private data class TrackingTransform(
         val dx: Double = 0.0,
         val dy: Double = 0.0,
@@ -63,12 +83,20 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private var lastProcessTime = 0L
     private val processInterval = 200L
     private var targetLanguageCode = "en"
-    private var sourceLanguageDisplay = "auto"
+    private var sourceLanguageDisplay = "Detected Language"
+    private val targetLanguageOptions = mutableListOf<LanguageOption>()
+    private val sourceLanguageOptions = mutableListOf<LanguageOption>()
+    private val downloadedLanguageCodes = mutableSetOf<String>()
+    private val downloadingLanguageCodes = mutableSetOf<String>()
+    private val languageCodeByDisplay = HashMap<String, String>()
     private val translationCache = HashMap<String, String>()
+    private lateinit var targetSpinnerAdapter: TargetLanguageAdapter
 
     private var renderJob: Job? = null
     private var trackingJob: Job? = null
     @Volatile private var overlayEnabled = false
+    @Volatile private var freezeFrameMode = false
+    private var frozenFrameBitmap: Bitmap? = null
     private val trackingLock = Any()
     private var trackedResults: MutableList<OcrService.DetectionResult> = mutableListOf()
     private var trackedTranslations: MutableList<String> = mutableListOf()
@@ -83,6 +111,17 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private val zoomResetThreshold = 0.22
 
     private val replacer = SceneTextReplacer()
+    private lateinit var scaleGestureDetector: ScaleGestureDetector
+    private lateinit var freezeGestureDetector: GestureDetector
+    private val freezeImageMatrix = Matrix()
+    private var freezeCurrentScale = 1f
+    private var freezeMinScale = 1f
+    private var freezeMaxScale = 1f
+    private var freezeImageWidth = 0f
+    private var freezeImageHeight = 0f
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+    private var isFreezeDragging = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -98,6 +137,8 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         setupSpinners()
         setupCamera()
         setupClickListeners()
+        setupBackPressHandler()
+        setupFreezeFrameZoom()
         observeProcessedFrames()
         startTrackingLoop()
 
@@ -134,6 +175,12 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 processOnInterval(results)
             }
         }.launchIn(lifecycleScope)
+
+        ocrService.motionStable.onEach { stable ->
+            if (!stable && !freezeFrameMode) {
+                clearTrackingState()
+            }
+        }.launchIn(lifecycleScope)
     }
 
     private var reusableBitmap: Bitmap? = null
@@ -149,6 +196,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 .collectLatest { mat ->  // CANCEL previous render if a new frame arrives
 
                     if (mat.empty()) return@collectLatest
+                    if (freezeFrameMode) return@collectLatest
 
                     // Clone immediately (Mat may change later)
                     val safeMat = mat.clone()
@@ -194,7 +242,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                         }
                     }
 
-                    if (bmp != null && overlayEnabled) {
+                    if (bmp != null && overlayEnabled && !freezeFrameMode) {
                         binding.processedOverlay.setImageBitmap(bmp)
                     }
                 }
@@ -205,6 +253,10 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         trackingJob?.cancel()
         trackingJob = lifecycleScope.launch(Dispatchers.Default) {
             while (isActive) {
+                if (freezeFrameMode) {
+                    kotlinx.coroutines.delay(trackIntervalMs)
+                    continue
+                }
                 val frame = FrameOcrRepository.latestCameraFrame.value?.clone()
                 if (frame != null && !frame.empty()) {
                     trackAndRender(frame)
@@ -217,6 +269,11 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun trackAndRender(frame: Mat) {
+        if (freezeFrameMode) {
+            frame.release()
+            return
+        }
+
         val (results, translations) = synchronized(trackingLock) {
             if (trackedResults.isEmpty()) {
                 return@synchronized null to null
@@ -225,6 +282,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
 
         if (results == null || translations == null) {
+            hideOverlayOnly()
             frame.release()
             return
         }
@@ -264,6 +322,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
 
         if (translations.none { it.isNotBlank() }) {
+            hideOverlayOnly()
             frame.release()
             return
         }
@@ -276,6 +335,18 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             binding.processedOverlay.visibility = View.VISIBLE
         }
         frame.release()
+    }
+
+    private fun hideOverlayOnly() {
+        if (freezeFrameMode) return
+        if (!overlayEnabled) return
+
+        overlayEnabled = false
+        FrameOcrRepository.clearFrame()
+        runOnUiThread {
+            binding.processedOverlay.setImageBitmap(null)
+            binding.processedOverlay.visibility = View.INVISIBLE
+        }
     }
 
     private fun toGray(src: Mat): Mat {
@@ -471,6 +542,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         Log.d(TAG, "Cleared detected blocks due to language change")
     }
     private fun processOnInterval(results: List<OcrService.DetectionResult>) {
+        if (freezeFrameMode) return
 
         val now = System.currentTimeMillis()
         if (now - lastProcessTime <= processInterval) return
@@ -536,127 +608,15 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     // Rendering is handled in trackAndRender using tracked patches + translations.
 
-    private fun saveFrameToFile(frameMat: Mat) {
-
-        lifecycleScope.launch(Dispatchers.IO) {
-
-            try {
-
-                val safeMat = frameMat.clone()   // ✅ CRITICAL FIX
-
-                if (safeMat.empty()) {
-                    Log.e("FrameSave", "Mat is empty — skipping save")
-                    return@launch
-                }
-
-                val timestamp = System.currentTimeMillis()
-                val filename = "frame_${timestamp}.jpg"
-
-                val directory = getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES)
-                val file = File(directory, filename)
-
-                val bitmap = createBitmap(safeMat.cols(), safeMat.rows())
-
-                org.opencv.android.Utils.matToBitmap(safeMat, bitmap)
-
-                FileOutputStream(file).use {
-                    bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, it)
-                }
-
-                bitmap.recycle()
-                safeMat.release()
-
-                Log.d("FrameSave", "Saved: ${file.absolutePath}")
-
-            } catch (e: Exception) {
-
-                Log.e("FrameSave", "Save failed", e)
-
-            }
-        }
-    }
-    private fun saveRoiToFile(roiMat: org.opencv.core.Mat?, originalText: String) {
-        if (roiMat == null || roiMat.empty()) return
-
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                // Create filename with timestamp
-                val timestamp = System.currentTimeMillis()
-                val safeText = originalText.replace("[^a-zA-Z0-9]".toRegex(), "_").take(20)
-                val filename = "roi_${timestamp}_${safeText}.jpg"
-
-                // Save to app's external files directory
-                val directory = getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES)
-                val file = File(directory, filename)
-
-                // Convert Mat to Bitmap and save as JPEG
-                val bitmap = createBitmap(roiMat.cols(), roiMat.rows())
-                org.opencv.android.Utils.matToBitmap(roiMat, bitmap)
-
-                FileOutputStream(file).use { out ->
-                    bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, out)
-                }
-
-                bitmap.recycle()
-
-                Log.d("ROISave", "Saved ROI to: ${file.absolutePath}")
-
-                // Also log the path for easy ADB pull
-                val adbPath = "/storage/emulated/0/Android/data/${packageName}/files/Pictures/$filename"
-                Log.d("ADB Pull", "To pull: adb pull \"$adbPath\"")
-
-            } catch (e: Exception) {
-                Log.e("ROI Save", "Failed to save ROI", e)
-            }
-        }
-    }
-
-    private fun saveRoiWithText(roiMat: org.opencv.core.Mat?, translatedText: String, originalText: String) {
-        if (roiMat == null || roiMat.empty()) return
-
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                val timestamp = System.currentTimeMillis()
-                val filename = "translated_${timestamp}.jpg"
-                val directory = getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES)
-                val file = File(directory, filename)
-
-                // Create a new Mat with text overlay
-                val displayMat = roiMat.clone()
-
-                // Add text to the image
-                val text = "Orig: $originalText\nTrans: $translatedText"
-                org.opencv.imgproc.Imgproc.putText(
-                    displayMat,
-                    text,
-                    org.opencv.core.Point(10.0, 30.0),
-                    org.opencv.imgproc.Imgproc.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    org.opencv.core.Scalar(255.0, 0.0, 0.0),
-                    1
-                )
-
-                // Save as JPEG
-                org.opencv.imgcodecs.Imgcodecs.imwrite(file.absolutePath, displayMat)
-
-                displayMat.release()
-
-                Log.d("ROI Save", "Saved translated ROI: ${file.absolutePath}")
-
-            } catch (e: Exception) {
-                Log.e("ROI Save", "Failed to save translated ROI", e)
-            }
-        }
-    }
-
     private fun translateText(
         text: String,
         detectedLanguage: String,
         onResult: (String) -> Unit
     ) {
+        val selectedSourceCode = getLanguageCode(sourceLanguageDisplay)
         val sourceLang = when {
-            sourceLanguageDisplay == "auto" -> mapDetectedLanguage(detectedLanguage)
-            sourceLanguageDisplay != "null" -> getLanguageCode(sourceLanguageDisplay)
+            selectedSourceCode == "auto" -> mapDetectedLanguage(detectedLanguage)
+            selectedSourceCode != "null" -> selectedSourceCode
             else -> "en"
         }
 
@@ -689,30 +649,61 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun setupSpinners() {
-        val languages = TranslateLanguage.getAllLanguages()
-            .map { Locale(it).getDisplayName(Locale.ENGLISH) }
-            .toMutableList()
-            .apply { add(0, "Detected Language") }
+        languageCodeByDisplay.clear()
+        sourceLanguageOptions.clear()
+        targetLanguageOptions.clear()
+        downloadingLanguageCodes.clear()
+        downloadedLanguageCodes.clear()
 
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, languages)
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        val usedLabels = HashSet<String>()
+        val supportedLanguages = TranslateLanguage.getAllLanguages()
+            .map { code ->
+                LanguageOption(
+                    label = buildLanguageLabel(code, usedLabels),
+                    code = code
+                )
+            }
+            .sortedBy { it.label }
 
-        binding.targetLanguage.adapter = adapter
-        binding.sourceLanguage.adapter = adapter
+        sourceLanguageOptions.add(LanguageOption("Detected Language", "auto"))
+        languageCodeByDisplay["Detected Language"] = "auto"
+        supportedLanguages.forEach { option ->
+            sourceLanguageOptions.add(option)
+            targetLanguageOptions.add(option)
+            languageCodeByDisplay[option.label] = option.code
+        }
+
+        val sourceAdapter = ArrayAdapter(
+            this,
+            R.layout.item_spinner_selected,
+            sourceLanguageOptions.map { it.label }
+        )
+        sourceAdapter.setDropDownViewResource(R.layout.item_spinner_dropdown_text)
+        binding.sourceLanguage.adapter = sourceAdapter
+
+        targetSpinnerAdapter = TargetLanguageAdapter()
+        binding.targetLanguage.adapter = targetSpinnerAdapter
 
         binding.targetLanguage.onItemSelectedListener = this
         binding.sourceLanguage.onItemSelectedListener = this
+        binding.targetLanguage.setOnTouchListener { _, _ ->
+            refreshDownloadedLanguageStatus()
+            false
+        }
 
-        binding.targetLanguage.setSelection(languages.indexOf("English"))
-        binding.sourceLanguage.setSelection(languages.indexOf("Detected Language"))
+        val targetEnglishIndex = targetLanguageOptions.indexOfFirst { it.code == "en" }.coerceAtLeast(0)
+        val sourceDetectedIndex = sourceLanguageOptions.indexOfFirst { it.code == "auto" }.coerceAtLeast(0)
+        binding.targetLanguage.setSelection(targetEnglishIndex)
+        binding.sourceLanguage.setSelection(sourceDetectedIndex)
+
+        refreshDownloadedLanguageStatus()
     }
 
     override fun onItemSelected(parent: AdapterView<*>, view: android.view.View?, pos: Int, id: Long) {
-        val selected = parent.getItemAtPosition(pos) as String
-
         when (parent.id) {
             R.id.targetLanguage -> {
-                val newLang = getLanguageCode(selected)
+                val selectedOption = targetLanguageOptions.getOrNull(pos) ?: return
+                val newLang = selectedOption.code
 
                 if (newLang != targetLanguageCode) {
 
@@ -724,6 +715,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 }
             }
             R.id.sourceLanguage -> {
+                val selected = parent.getItemAtPosition(pos) as? String ?: return
                 if (selected != sourceLanguageDisplay) {
 
                     sourceLanguageDisplay = selected
@@ -739,17 +731,160 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     override fun onNothingSelected(parent: AdapterView<*>) {
         when (parent.id) {
             R.id.targetLanguage -> targetLanguageCode = "en"
-            R.id.sourceLanguage -> sourceLanguageDisplay = "auto"
+            R.id.sourceLanguage -> sourceLanguageDisplay = "Detected Language"
         }
     }
 
     private fun getLanguageCode(displayName: String): String {
-        return when (displayName) {
-            "Detected Language" -> "auto"
-            else -> Locale.getAvailableLocales()
-                .find { it.getDisplayName(Locale.ENGLISH).equals(displayName, ignoreCase = true) }
-                ?.language ?: "en"
+        return languageCodeByDisplay[displayName] ?: "en"
+    }
+
+    private fun buildLanguageLabel(code: String, usedLabels: MutableSet<String>): String {
+        val baseLabel = Locale(code).getDisplayName(Locale.ENGLISH).ifBlank { code }
+        var label = baseLabel
+        if (usedLabels.contains(label)) {
+            label = "$baseLabel ($code)"
         }
+        usedLabels.add(label)
+        return label
+    }
+
+    private fun isLanguageModelDownloaded(languageCode: String): Boolean {
+        return downloadedLanguageCodes.contains(languageCode)
+    }
+
+    private fun refreshDownloadedLanguageStatus() {
+        translationService.getDownloadedLanguageModels(
+            onSuccess = { codes ->
+                runOnUiThread {
+                    downloadedLanguageCodes.clear()
+                    downloadedLanguageCodes.addAll(codes)
+                    targetSpinnerAdapter.notifyDataSetChanged()
+                }
+            },
+            onError = { error ->
+                Log.e(TAG, "Failed loading downloaded language models", error)
+            }
+        )
+    }
+
+    private fun requestLanguageModelDownload(option: LanguageOption) {
+        val code = option.code
+        if (isLanguageModelDownloaded(code) || downloadingLanguageCodes.contains(code)) return
+
+        downloadingLanguageCodes.add(code)
+        targetSpinnerAdapter.notifyDataSetChanged()
+
+        translationService.downloadLanguageModel(
+            languageCode = code,
+            onSuccess = {
+                runOnUiThread {
+                    downloadingLanguageCodes.remove(code)
+                    downloadedLanguageCodes.add(code)
+                    targetSpinnerAdapter.notifyDataSetChanged()
+                    showToast("${option.label} language pack downloaded")
+                }
+            },
+            onError = { error ->
+                runOnUiThread {
+                    downloadingLanguageCodes.remove(code)
+                    targetSpinnerAdapter.notifyDataSetChanged()
+                    showToast("Failed to download ${option.label}")
+                }
+                Log.e(TAG, "Model download failed for ${option.label}", error)
+            }
+        )
+    }
+
+    private inner class TargetLanguageAdapter : ArrayAdapter<LanguageOption>(
+        this@MainActivity,
+        R.layout.item_spinner_selected,
+        targetLanguageOptions
+    ) {
+        override fun getCount(): Int = targetLanguageOptions.size
+
+        override fun getItem(position: Int): LanguageOption = targetLanguageOptions[position]
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val view = convertView ?: layoutInflater.inflate(R.layout.item_spinner_selected, parent, false)
+            val text = view.findViewById<TextView>(R.id.spinnerText)
+            text.text = getItem(position).label
+            return view
+        }
+
+        override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val view = convertView
+                ?: layoutInflater.inflate(R.layout.item_target_language_dropdown, parent, false)
+
+            val option = getItem(position)
+            val label = view.findViewById<TextView>(R.id.languageLabel)
+            val downloadIcon = view.findViewById<ImageButton>(R.id.downloadIcon)
+            label.text = option.label
+
+            val shouldShowDownload = !isLanguageModelDownloaded(option.code)
+            if (shouldShowDownload) {
+                val isDownloading = downloadingLanguageCodes.contains(option.code)
+                downloadIcon.visibility = View.VISIBLE
+                downloadIcon.setImageResource(
+                    if (isDownloading) R.drawable.ic_downloading_20 else R.drawable.ic_download_20
+                )
+                if (isDownloading) {
+                    startDownloadIconAnimation(downloadIcon)
+                } else {
+                    stopDownloadIconAnimation(downloadIcon)
+                }
+                downloadIcon.isEnabled = !isDownloading
+                downloadIcon.contentDescription = getString(
+                    if (isDownloading) R.string.downloading_language_pack else R.string.download_language_pack
+                )
+                downloadIcon.setOnClickListener {
+                    requestLanguageModelDownload(option)
+                }
+            } else {
+                stopDownloadIconAnimation(downloadIcon)
+                downloadIcon.visibility = View.GONE
+                downloadIcon.setOnClickListener(null)
+            }
+
+            return view
+        }
+    }
+
+    private fun startDownloadIconAnimation(icon: ImageButton) {
+        val existing = icon.tag as? Animator
+        if (existing?.isRunning == true) return
+        existing?.cancel()
+
+        val spin = ObjectAnimator.ofFloat(icon, View.ROTATION, 0f, 360f).apply {
+            duration = 1050L
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+        }
+        val pulse = ObjectAnimator.ofPropertyValuesHolder(
+            icon,
+            PropertyValuesHolder.ofFloat(View.SCALE_X, 1f, 0.9f, 1f),
+            PropertyValuesHolder.ofFloat(View.SCALE_Y, 1f, 0.9f, 1f),
+            PropertyValuesHolder.ofFloat(View.ALPHA, 1f, 0.7f, 1f)
+        ).apply {
+            duration = 820L
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = FastOutSlowInInterpolator()
+        }
+
+        val animatorSet = AnimatorSet().apply {
+            playTogether(spin, pulse)
+        }
+        icon.tag = animatorSet
+        animatorSet.start()
+    }
+
+    private fun stopDownloadIconAnimation(icon: ImageButton) {
+        (icon.tag as? Animator)?.cancel()
+        icon.tag = null
+        icon.rotation = 0f
+        icon.scaleX = 1f
+        icon.scaleY = 1f
+        icon.alpha = 1f
     }
 
     private fun setupCamera() {
@@ -762,7 +897,254 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     private fun setupClickListeners() {
         binding.imageCaptureButton.setOnClickListener {
-            cameraController.takePhoto()
+            if (freezeFrameMode) {
+                exitFreezeFrameMode()
+            } else {
+                enterFreezeFrameMode()
+            }
+        }
+    }
+
+    private fun setupBackPressHandler() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (freezeFrameMode) {
+                    exitFreezeFrameMode()
+                    return
+                }
+
+                isEnabled = false
+                onBackPressedDispatcher.onBackPressed()
+                isEnabled = true
+            }
+        })
+    }
+
+    private fun setupFreezeFrameZoom() {
+        scaleGestureDetector = ScaleGestureDetector(
+            this,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    if (!freezeFrameMode) return false
+                    applyFreezeScale(detector.scaleFactor, detector.focusX, detector.focusY)
+                    return true
+                }
+            }
+        )
+
+        freezeGestureDetector = GestureDetector(
+            this,
+            object : GestureDetector.SimpleOnGestureListener() {
+                override fun onDoubleTap(e: MotionEvent): Boolean {
+                    if (!freezeFrameMode) return false
+                    val target = if (freezeCurrentScale <= freezeMinScale * 1.2f) {
+                        (freezeMinScale * 2.0f).coerceAtMost(freezeMaxScale)
+                    } else {
+                        freezeMinScale
+                    }
+                    scaleFreezeTo(target, e.x, e.y)
+                    return true
+                }
+            }
+        )
+
+        binding.processedOverlay.setOnTouchListener { _, event ->
+            if (!freezeFrameMode) return@setOnTouchListener false
+
+            freezeGestureDetector.onTouchEvent(event)
+            scaleGestureDetector.onTouchEvent(event)
+
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    lastTouchX = event.x
+                    lastTouchY = event.y
+                    isFreezeDragging = true
+                }
+
+                MotionEvent.ACTION_MOVE -> {
+                    if (!scaleGestureDetector.isInProgress && isFreezeDragging && event.pointerCount == 1) {
+                        val dx = event.x - lastTouchX
+                        val dy = event.y - lastTouchY
+                        freezeImageMatrix.postTranslate(dx, dy)
+                        constrainFreezeMatrix()
+                        binding.processedOverlay.imageMatrix = freezeImageMatrix
+                        lastTouchX = event.x
+                        lastTouchY = event.y
+                    }
+                }
+
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    isFreezeDragging = false
+                }
+
+                MotionEvent.ACTION_UP,
+                MotionEvent.ACTION_CANCEL -> {
+                    isFreezeDragging = false
+                }
+            }
+
+            true
+        }
+    }
+
+    private fun enterFreezeFrameMode() {
+        if (freezeFrameMode) return
+
+        val snapshot = snapshotCurrentFrame() ?: run {
+            showToast("No frame available yet")
+            return
+        }
+
+        lifecycleScope.launch(Dispatchers.Default) {
+            val frozenBitmap = matToDisplayBitmap(snapshot)
+            snapshot.release()
+
+            withContext(Dispatchers.Main) {
+                if (frozenBitmap == null) {
+                    showToast("Failed to capture frame")
+                    return@withContext
+                }
+
+                freezeFrameMode = true
+                cameraController.stopCamera()
+                frozenFrameBitmap?.recycle()
+                frozenFrameBitmap = frozenBitmap
+
+                binding.processedOverlay.scaleType = ImageView.ScaleType.MATRIX
+                binding.processedOverlay.setImageBitmap(frozenBitmap)
+                binding.processedOverlay.post { resetFreezeImageMatrix() }
+                binding.processedOverlay.visibility = View.VISIBLE
+                overlayEnabled = true
+            }
+        }
+    }
+
+    private fun exitFreezeFrameMode() {
+        if (!freezeFrameMode) return
+
+        freezeFrameMode = false
+        clearTrackingState()
+        ocrService.resetCache()
+        lastProcessTime = 0L
+        frozenFrameBitmap?.recycle()
+        frozenFrameBitmap = null
+        resetFreezeState()
+        binding.processedOverlay.scaleType = ImageView.ScaleType.FIT_CENTER
+        startCameraWithOcr()
+    }
+
+    private fun resetFreezeImageMatrix() {
+        val drawable = binding.processedOverlay.drawable ?: return
+        val viewWidth = binding.processedOverlay.width.toFloat()
+        val viewHeight = binding.processedOverlay.height.toFloat()
+        if (viewWidth <= 0f || viewHeight <= 0f) return
+
+        val imageWidth = drawable.intrinsicWidth.toFloat()
+        val imageHeight = drawable.intrinsicHeight.toFloat()
+        if (imageWidth <= 0f || imageHeight <= 0f) return
+
+        freezeImageWidth = imageWidth
+        freezeImageHeight = imageHeight
+        freezeMinScale = minOf(viewWidth / imageWidth, viewHeight / imageHeight)
+        freezeMaxScale = freezeMinScale * 5f
+        freezeCurrentScale = freezeMinScale
+
+        val offsetX = (viewWidth - imageWidth * freezeMinScale) * 0.5f
+        val offsetY = (viewHeight - imageHeight * freezeMinScale) * 0.5f
+
+        freezeImageMatrix.reset()
+        freezeImageMatrix.postScale(freezeMinScale, freezeMinScale)
+        freezeImageMatrix.postTranslate(offsetX, offsetY)
+        binding.processedOverlay.imageMatrix = freezeImageMatrix
+    }
+
+    private fun applyFreezeScale(scaleFactor: Float, focusX: Float, focusY: Float) {
+        if (scaleFactor <= 0f) return
+        val targetScale = (freezeCurrentScale * scaleFactor).coerceIn(freezeMinScale, freezeMaxScale)
+        scaleFreezeTo(targetScale, focusX, focusY)
+    }
+
+    private fun scaleFreezeTo(targetScale: Float, focusX: Float, focusY: Float) {
+        val appliedFactor = targetScale / freezeCurrentScale
+        if (appliedFactor == 1f) return
+        freezeImageMatrix.postScale(appliedFactor, appliedFactor, focusX, focusY)
+        freezeCurrentScale = targetScale
+        constrainFreezeMatrix()
+        binding.processedOverlay.imageMatrix = freezeImageMatrix
+    }
+
+    private fun constrainFreezeMatrix() {
+        if (freezeImageWidth <= 0f || freezeImageHeight <= 0f) return
+        val viewWidth = binding.processedOverlay.width.toFloat()
+        val viewHeight = binding.processedOverlay.height.toFloat()
+        if (viewWidth <= 0f || viewHeight <= 0f) return
+
+        val mapped = RectF(0f, 0f, freezeImageWidth, freezeImageHeight)
+        freezeImageMatrix.mapRect(mapped)
+
+        val dx = when {
+            mapped.width() <= viewWidth -> viewWidth * 0.5f - mapped.centerX()
+            mapped.left > 0f -> -mapped.left
+            mapped.right < viewWidth -> viewWidth - mapped.right
+            else -> 0f
+        }
+
+        val dy = when {
+            mapped.height() <= viewHeight -> viewHeight * 0.5f - mapped.centerY()
+            mapped.top > 0f -> -mapped.top
+            mapped.bottom < viewHeight -> viewHeight - mapped.bottom
+            else -> 0f
+        }
+
+        if (dx != 0f || dy != 0f) {
+            freezeImageMatrix.postTranslate(dx, dy)
+        }
+    }
+
+    private fun resetFreezeState() {
+        freezeImageMatrix.reset()
+        freezeCurrentScale = 1f
+        freezeMinScale = 1f
+        freezeMaxScale = 1f
+        freezeImageWidth = 0f
+        freezeImageHeight = 0f
+        isFreezeDragging = false
+    }
+
+    private fun snapshotCurrentFrame(): Mat? {
+        val processed = FrameOcrRepository.currentFrame.value
+        if (processed != null && !processed.empty()) {
+            return processed.clone()
+        }
+
+        val raw = FrameOcrRepository.latestCameraFrame.value
+        if (raw != null && !raw.empty()) {
+            return raw.clone()
+        }
+
+        return null
+    }
+
+    private fun matToDisplayBitmap(source: Mat): Bitmap? {
+        if (source.empty() || source.cols() <= 0 || source.rows() <= 0) return null
+
+        val rgba = Mat()
+        return try {
+            when (source.channels()) {
+                4 -> source.copyTo(rgba)
+                3 -> Imgproc.cvtColor(source, rgba, Imgproc.COLOR_BGR2RGBA)
+                1 -> Imgproc.cvtColor(source, rgba, Imgproc.COLOR_GRAY2RGBA)
+                else -> return null
+            }
+
+            Bitmap.createBitmap(source.cols(), source.rows(), Bitmap.Config.ARGB_8888).also { bmp ->
+                org.opencv.android.Utils.matToBitmap(rgba, bmp)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to convert Mat to Bitmap", e)
+            null
+        } finally {
+            rgba.release()
         }
     }
 
@@ -782,10 +1164,13 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     override fun onDestroy() {
         super.onDestroy()
+        cameraController.stopCamera()
         ocrService.cleanup()
         trackingJob?.cancel()
         prevGrayTrack?.release()
         prevGrayTrack = null
+        frozenFrameBitmap?.recycle()
+        frozenFrameBitmap = null
         cameraExecutor.shutdown()
     }
 

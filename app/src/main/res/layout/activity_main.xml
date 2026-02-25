@@ -5,18 +5,16 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="@android:color/white"
     tools:context=".MainActivity">
-
-    <!-- Camera Preview -->
-
-    <!-- Image Capture Button -->
 
     <FrameLayout
         android:id="@+id/cameraContainer"
         android:layout_width="0dp"
         android:layout_height="0dp"
+        android:background="@android:color/white"
         app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintBottom_toTopOf="@+id/controlPanel"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 
@@ -25,59 +23,77 @@
             android:id="@+id/viewFinder"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            app:scaleType="fillCenter" />
+            android:background="@android:color/white"
+            app:implementationMode="compatible"
+            app:scaleType="fitCenter" />
 
         <!-- Processed Frame Overlay -->
         <ImageView
             android:id="@+id/processedOverlay"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:scaleType="centerCrop"
-            android:adjustViewBounds="true" />
+            android:background="@android:color/white"
+            android:scaleType="fitCenter" />
 
     </FrameLayout>
 
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/image_capture_button"
-        android:layout_width="70dp"
-        android:layout_height="70dp"
-        android:layout_marginBottom="150dp"
-        android:elevation="2dp"
-        android:background="@drawable/white_rounded_button"
-        app:backgroundTint="@android:color/white"
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/controlPanel"
+        android:layout_width="0dp"
+        android:layout_height="180dp"
+        android:background="#F7F8FA"
         app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
-    <Spinner
-        android:id="@+id/targetLanguage"
-        android:layout_width="100dp"
-        android:layout_height="50dp"
-        android:layout_marginBottom="50dp"
-        android:background="@drawable/spinner_bg"
-        android:dropDownVerticalOffset="8dp"
-        android:popupBackground="@android:color/white"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toEndOf="@id/vertical_centerline"
-        app:layout_constraintEnd_toEndOf="parent" />
-    <Spinner
-        android:id="@+id/sourceLanguage"
-        android:layout_width="100dp"
-        android:layout_height="50dp"
-        android:layout_marginBottom="50dp"
-        android:background="@drawable/spinner_bg"
-        android:dropDownVerticalOffset="8dp"
-        android:popupBackground="@android:color/white"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toStartOf="@id/vertical_centerline"/>
-    <!-- Vertical Centerline Guideline -->
-    <androidx.constraintlayout.widget.Guideline
-        android:id="@+id/vertical_centerline"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:orientation="vertical"
-        app:layout_constraintGuide_percent="0.5" />
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintHorizontal_bias="0.0"
+        app:layout_constraintStart_toStartOf="parent">
 
+        <Spinner
+            android:id="@+id/sourceLanguage"
+            android:layout_width="138dp"
+            android:layout_height="50dp"
+            android:layout_marginTop="4dp"
+            android:background="@drawable/spinner_bg"
+            android:dropDownWidth="230dp"
+            android:dropDownVerticalOffset="8dp"
+            android:popupBackground="@drawable/spinner_popup_bg"
+            app:layout_constraintEnd_toStartOf="@id/controlCenterline"
+            app:layout_constraintHorizontal_bias="0.488"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
 
+        <Spinner
+            android:id="@+id/targetLanguage"
+            android:layout_width="138dp"
+            android:layout_height="50dp"
+            android:layout_marginTop="4dp"
+            android:background="@drawable/spinner_bg"
+            android:dropDownWidth="260dp"
+            android:dropDownVerticalOffset="8dp"
+            android:popupBackground="@drawable/spinner_popup_bg"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintHorizontal_bias="0.505"
+            app:layout_constraintStart_toEndOf="@id/controlCenterline"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/image_capture_button"
+            android:layout_width="70dp"
+            android:layout_height="70dp"
+            android:layout_marginBottom="22dp"
+            android:background="@drawable/white_rounded_button"
+            android:elevation="2dp"
+            app:backgroundTint="@null"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent" />
+
+        <androidx.constraintlayout.widget.Guideline
+            android:id="@+id/controlCenterline"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            app:layout_constraintGuide_percent="0.5" />
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

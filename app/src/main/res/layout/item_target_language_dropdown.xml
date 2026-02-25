@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="48dp"
+    android:background="@drawable/spinner_dropdown_item_bg"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="14dp"
+    android:paddingEnd="10dp">
+
+    <TextView
+        android:id="@+id/languageLabel"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:ellipsize="end"
+        android:maxLines="1"
+        android:textColor="#111827"
+        android:textSize="15sp" />
+
+    <androidx.appcompat.widget.AppCompatImageButton
+        android:id="@+id/downloadIcon"
+        android:layout_width="34dp"
+        android:layout_height="34dp"
+        android:background="@drawable/download_button_bg"
+        android:contentDescription="@string/download_language_pack"
+        android:padding="7dp"
+        app:srcCompat="@drawable/ic_download_20" />
+
+</LinearLayout>
