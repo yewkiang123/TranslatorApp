@@ -33,6 +33,7 @@ import androidx.interpolator.view.animation.FastOutSlowInInterpolator
 import androidx.lifecycle.lifecycleScope
 import com.example.translatorapp.camera.CameraController
 import com.example.translatorapp.databinding.ActivityMainBinding
+import com.example.translatorapp.logic.LanguageUiLogic
 import com.example.translatorapp.ocr.OcrService
 import com.example.translatorapp.translate.TranslationService
 import com.google.mlkit.nl.translate.TranslateLanguage
@@ -59,7 +60,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.hypot
-import kotlin.math.roundToInt
 
 
 class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
@@ -72,6 +72,12 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         val dx: Double = 0.0,
         val dy: Double = 0.0,
         val scale: Double = 1.0
+    )
+
+    private data class TrackingSnapshot(
+        val results: List<OcrService.DetectionResult>,
+        val translations: List<String>,
+        val anchorGray: Mat
     )
 
     private lateinit var binding: ActivityMainBinding
@@ -90,6 +96,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private val downloadingLanguageCodes = mutableSetOf<String>()
     private val languageCodeByDisplay = HashMap<String, String>()
     private val translationCache = HashMap<String, String>()
+    private lateinit var sourceSpinnerAdapter: SourceLanguageAdapter
     private lateinit var targetSpinnerAdapter: TargetLanguageAdapter
 
     private var renderJob: Job? = null
@@ -100,7 +107,8 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private val trackingLock = Any()
     private var trackedResults: MutableList<OcrService.DetectionResult> = mutableListOf()
     private var trackedTranslations: MutableList<String> = mutableListOf()
-    private var prevGrayTrack: Mat? = null
+    private var trackingAnchorGray: Mat? = null
+    private var lastTrackingTransform = TrackingTransform()
     private val trackIntervalMs = 120L
     private val panThresholdPx = 80.0
     private val minTrackShiftPx = 1.5
@@ -274,24 +282,39 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             return
         }
 
-        val (results, translations) = synchronized(trackingLock) {
+        val snapshot = synchronized(trackingLock) {
             if (trackedResults.isEmpty()) {
-                return@synchronized null to null
+                return@synchronized null
             }
-            trackedResults.map { it.copy() } to trackedTranslations.toList()
+            val anchor = trackingAnchorGray?.clone()
+            if (anchor == null || anchor.empty()) {
+                anchor?.release()
+                return@synchronized null
+            }
+            TrackingSnapshot(
+                results = trackedResults.map { it.copy() },
+                translations = trackedTranslations.toList(),
+                anchorGray = anchor
+            )
         }
 
-        if (results == null || translations == null) {
+        if (snapshot == null) {
             hideOverlayOnly()
             frame.release()
             return
         }
 
         val currentGray = toGray(frame)
-        val previousGray = prevGrayTrack
-        val transform = estimateTrackingTransform(previousGray, currentGray)
-        prevGrayTrack = currentGray
-        previousGray?.release()
+        val estimatedTransform = estimateTrackingTransform(snapshot.anchorGray, currentGray)
+        currentGray.release()
+        snapshot.anchorGray.release()
+
+        val transform = synchronized(trackingLock) {
+            if (estimatedTransform != null) {
+                lastTrackingTransform = estimatedTransform
+            }
+            lastTrackingTransform
+        }
 
         if (abs(transform.dx) + abs(transform.dy) > panThresholdPx ||
             abs(transform.scale - 1.0) > zoomResetThreshold) {
@@ -300,7 +323,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             return
         }
 
-        val shifted = results.map { result ->
+        val shifted = snapshot.results.map { result ->
             val box = result.boundingBox ?: return@map result
             val shiftedBox = shiftRect(box, transform, frame.cols(), frame.rows())
             val shiftedCorners = if (shiftedBox != null) {
@@ -317,17 +340,13 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             return
         }
 
-        synchronized(trackingLock) {
-            trackedResults = shifted.toMutableList()
-        }
-
-        if (translations.none { it.isNotBlank() }) {
+        if (snapshot.translations.none { it.isNotBlank() }) {
             hideOverlayOnly()
             frame.release()
             return
         }
 
-        val updated = replacer.replaceText(frame, shifted, translations)
+        val updated = replacer.replaceText(frame, shifted, snapshot.translations)
         FrameOcrRepository.updateFrame(updated)
         updated.release()
         overlayEnabled = true
@@ -360,14 +379,14 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         return gray
     }
 
-    private fun estimateTrackingTransform(prev: Mat?, current: Mat): TrackingTransform {
-        if (prev == null || prev.empty()) return TrackingTransform()
+    private fun estimateTrackingTransform(prev: Mat?, current: Mat): TrackingTransform? {
+        if (prev == null || prev.empty()) return null
 
         val points = MatOfPoint()
         Imgproc.goodFeaturesToTrack(prev, points, 120, 0.01, 8.0)
         if (points.empty()) {
             points.release()
-            return TrackingTransform()
+            return null
         }
 
         val prevPts = MatOfPoint2f(*points.toArray())
@@ -400,7 +419,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
 
         if (prevValid.size < 6) {
-            return TrackingTransform()
+            return null
         }
 
         val dxSamples = ArrayList<Double>(prevValid.size)
@@ -517,12 +536,13 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         synchronized(trackingLock) {
             trackedResults.clear()
             trackedTranslations.clear()
+            trackingAnchorGray?.release()
+            trackingAnchorGray = null
+            lastTrackingTransform = TrackingTransform()
         }
         translationCache.clear()
         FrameOcrRepository.clearFrame()
         overlayEnabled = false
-        prevGrayTrack?.release()
-        prevGrayTrack = null
         runOnUiThread {
             binding.processedOverlay.setImageBitmap(null)
             binding.processedOverlay.visibility = View.INVISIBLE
@@ -559,10 +579,14 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
         // Make mutable translated list
         val translatedTexts = MutableList(results.size) { "" }
+        val anchorGray = toGray(baseFrame)
 
         synchronized(trackingLock) {
             trackedResults = results.map { it.copy() }.toMutableList()
             trackedTranslations = translatedTexts
+            trackingAnchorGray?.release()
+            trackingAnchorGray = anchorGray
+            lastTrackingTransform = TrackingTransform()
         }
 
         results.forEachIndexed { index, result ->
@@ -614,13 +638,9 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         onResult: (String) -> Unit
     ) {
         val selectedSourceCode = getLanguageCode(sourceLanguageDisplay)
-        val sourceLang = when {
-            selectedSourceCode == "auto" -> mapDetectedLanguage(detectedLanguage)
-            selectedSourceCode != "null" -> selectedSourceCode
-            else -> "en"
-        }
+        val sourceLang = LanguageUiLogic.resolveSourceLanguage(selectedSourceCode, detectedLanguage)
 
-        if (sourceLang == targetLanguageCode || text.trim().isEmpty()) {
+        if (LanguageUiLogic.shouldBypassTranslation(sourceLang, targetLanguageCode, text)) {
             showToast("Languages are same:\n$text")
             onResult(text)   // still return something
             return
@@ -642,10 +662,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
 
     private fun mapDetectedLanguage(detected: String): String {
-        return when (detected) {
-            "zh", "ja", "ko" -> detected
-            else -> "en"
-        }
+        return LanguageUiLogic.mapDetectedLanguage(detected)
     }
 
     private fun setupSpinners() {
@@ -673,13 +690,8 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             languageCodeByDisplay[option.label] = option.code
         }
 
-        val sourceAdapter = ArrayAdapter(
-            this,
-            R.layout.item_spinner_selected,
-            sourceLanguageOptions.map { it.label }
-        )
-        sourceAdapter.setDropDownViewResource(R.layout.item_spinner_dropdown_text)
-        binding.sourceLanguage.adapter = sourceAdapter
+        sourceSpinnerAdapter = SourceLanguageAdapter()
+        binding.sourceLanguage.adapter = sourceSpinnerAdapter
 
         targetSpinnerAdapter = TargetLanguageAdapter()
         binding.targetLanguage.adapter = targetSpinnerAdapter
@@ -687,6 +699,10 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         binding.targetLanguage.onItemSelectedListener = this
         binding.sourceLanguage.onItemSelectedListener = this
         binding.targetLanguage.setOnTouchListener { _, _ ->
+            refreshDownloadedLanguageStatus()
+            false
+        }
+        binding.sourceLanguage.setOnTouchListener { _, _ ->
             refreshDownloadedLanguageStatus()
             false
         }
@@ -715,7 +731,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 }
             }
             R.id.sourceLanguage -> {
-                val selected = parent.getItemAtPosition(pos) as? String ?: return
+                val selected = sourceLanguageOptions.getOrNull(pos)?.label ?: return
                 if (selected != sourceLanguageDisplay) {
 
                     sourceLanguageDisplay = selected
@@ -740,13 +756,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun buildLanguageLabel(code: String, usedLabels: MutableSet<String>): String {
-        val baseLabel = Locale(code).getDisplayName(Locale.ENGLISH).ifBlank { code }
-        var label = baseLabel
-        if (usedLabels.contains(label)) {
-            label = "$baseLabel ($code)"
-        }
-        usedLabels.add(label)
-        return label
+        return LanguageUiLogic.buildLanguageLabel(code, usedLabels)
     }
 
     private fun isLanguageModelDownloaded(languageCode: String): Boolean {
@@ -759,7 +769,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 runOnUiThread {
                     downloadedLanguageCodes.clear()
                     downloadedLanguageCodes.addAll(codes)
-                    targetSpinnerAdapter.notifyDataSetChanged()
+                    notifyLanguageAdaptersChanged()
                 }
             },
             onError = { error ->
@@ -773,7 +783,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         if (isLanguageModelDownloaded(code) || downloadingLanguageCodes.contains(code)) return
 
         downloadingLanguageCodes.add(code)
-        targetSpinnerAdapter.notifyDataSetChanged()
+        notifyLanguageAdaptersChanged()
 
         translationService.downloadLanguageModel(
             languageCode = code,
@@ -781,19 +791,110 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 runOnUiThread {
                     downloadingLanguageCodes.remove(code)
                     downloadedLanguageCodes.add(code)
-                    targetSpinnerAdapter.notifyDataSetChanged()
+                    notifyLanguageAdaptersChanged()
                     showToast("${option.label} language pack downloaded")
                 }
             },
             onError = { error ->
                 runOnUiThread {
                     downloadingLanguageCodes.remove(code)
-                    targetSpinnerAdapter.notifyDataSetChanged()
+                    notifyLanguageAdaptersChanged()
                     showToast("Failed to download ${option.label}")
                 }
                 Log.e(TAG, "Model download failed for ${option.label}", error)
             }
         )
+    }
+
+    private fun notifyLanguageAdaptersChanged() {
+        if (::sourceSpinnerAdapter.isInitialized) {
+            sourceSpinnerAdapter.notifyDataSetChanged()
+        }
+        if (::targetSpinnerAdapter.isInitialized) {
+            targetSpinnerAdapter.notifyDataSetChanged()
+        }
+    }
+
+    private fun bindLanguageDropdownRow(view: View, option: LanguageOption, allowDownload: Boolean) {
+        val label = view.findViewById<TextView>(R.id.languageLabel)
+        val downloadIcon = view.findViewById<ImageButton>(R.id.downloadIcon)
+        label.text = option.label
+
+        if (!allowDownload) {
+            stopDownloadIconAnimation(downloadIcon)
+            downloadIcon.visibility = View.GONE
+            downloadIcon.setOnClickListener(null)
+            return
+        }
+
+        val presentation = LanguageUiLogic.computeDownloadPresentation(
+            isDownloaded = isLanguageModelDownloaded(option.code),
+            isDownloading = downloadingLanguageCodes.contains(option.code)
+        )
+
+        if (presentation.iconState == LanguageUiLogic.DownloadIconState.HIDDEN) {
+            stopDownloadIconAnimation(downloadIcon)
+            downloadIcon.visibility = View.GONE
+            downloadIcon.setOnClickListener(null)
+            return
+        }
+
+        downloadIcon.visibility = View.VISIBLE
+        downloadIcon.setImageResource(
+            if (presentation.iconState == LanguageUiLogic.DownloadIconState.DOWNLOADING) {
+                R.drawable.ic_downloading_20
+            } else {
+                R.drawable.ic_download_20
+            }
+        )
+
+        if (presentation.iconState == LanguageUiLogic.DownloadIconState.DOWNLOADING) {
+            startDownloadIconAnimation(downloadIcon)
+        } else {
+            stopDownloadIconAnimation(downloadIcon)
+        }
+
+        downloadIcon.isEnabled = presentation.enabled
+        downloadIcon.contentDescription = getString(
+            if (presentation.iconState == LanguageUiLogic.DownloadIconState.DOWNLOADING) {
+                R.string.downloading_language_pack
+            } else {
+                R.string.download_language_pack
+            }
+        )
+        downloadIcon.setOnClickListener {
+            requestLanguageModelDownload(option)
+        }
+    }
+
+    private inner class SourceLanguageAdapter : ArrayAdapter<LanguageOption>(
+        this@MainActivity,
+        R.layout.item_spinner_selected,
+        sourceLanguageOptions
+    ) {
+        override fun getCount(): Int = sourceLanguageOptions.size
+
+        override fun getItem(position: Int): LanguageOption = sourceLanguageOptions[position]
+
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val view = convertView ?: layoutInflater.inflate(R.layout.item_spinner_selected, parent, false)
+            val text = view.findViewById<TextView>(R.id.spinnerText)
+            text.text = getItem(position).label
+            return view
+        }
+
+        override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+            val view = convertView
+                ?: layoutInflater.inflate(R.layout.item_target_language_dropdown, parent, false)
+
+            val option = getItem(position)
+            bindLanguageDropdownRow(
+                view = view,
+                option = option,
+                allowDownload = option.code != "auto"
+            )
+            return view
+        }
     }
 
     private inner class TargetLanguageAdapter : ArrayAdapter<LanguageOption>(
@@ -817,34 +918,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 ?: layoutInflater.inflate(R.layout.item_target_language_dropdown, parent, false)
 
             val option = getItem(position)
-            val label = view.findViewById<TextView>(R.id.languageLabel)
-            val downloadIcon = view.findViewById<ImageButton>(R.id.downloadIcon)
-            label.text = option.label
-
-            val shouldShowDownload = !isLanguageModelDownloaded(option.code)
-            if (shouldShowDownload) {
-                val isDownloading = downloadingLanguageCodes.contains(option.code)
-                downloadIcon.visibility = View.VISIBLE
-                downloadIcon.setImageResource(
-                    if (isDownloading) R.drawable.ic_downloading_20 else R.drawable.ic_download_20
-                )
-                if (isDownloading) {
-                    startDownloadIconAnimation(downloadIcon)
-                } else {
-                    stopDownloadIconAnimation(downloadIcon)
-                }
-                downloadIcon.isEnabled = !isDownloading
-                downloadIcon.contentDescription = getString(
-                    if (isDownloading) R.string.downloading_language_pack else R.string.download_language_pack
-                )
-                downloadIcon.setOnClickListener {
-                    requestLanguageModelDownload(option)
-                }
-            } else {
-                stopDownloadIconAnimation(downloadIcon)
-                downloadIcon.visibility = View.GONE
-                downloadIcon.setOnClickListener(null)
-            }
+            bindLanguageDropdownRow(view = view, option = option, allowDownload = true)
 
             return view
         }
@@ -1167,8 +1241,10 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         cameraController.stopCamera()
         ocrService.cleanup()
         trackingJob?.cancel()
-        prevGrayTrack?.release()
-        prevGrayTrack = null
+        synchronized(trackingLock) {
+            trackingAnchorGray?.release()
+            trackingAnchorGray = null
+        }
         frozenFrameBitmap?.recycle()
         frozenFrameBitmap = null
         cameraExecutor.shutdown()

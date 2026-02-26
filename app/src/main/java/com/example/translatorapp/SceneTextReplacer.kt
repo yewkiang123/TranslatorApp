@@ -8,12 +8,15 @@ import android.graphics.Typeface
 import android.util.Log
 import androidx.core.graphics.createBitmap
 import org.opencv.android.Utils
+import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
 import org.opencv.core.Point
 import org.opencv.core.Scalar
+import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import org.opencv.photo.Photo
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.roundToInt
@@ -24,6 +27,8 @@ class SceneTextReplacer(
 
     companion object {
         private const val TAG = "SceneTextReplacer"
+        private const val TELEA_INPAINT_RADIUS = 3.0
+        private const val INPAINT_MASK_DILATE_SIZE = 3
         private const val GENERATED_TEXT_SCALE = 0.8f
         private const val ANGLE_SNAP_DEGREES = 1.25f
         private const val MIN_TEXT_BACKGROUND_DISTANCE = 48.0
@@ -33,8 +38,7 @@ class SceneTextReplacer(
         val result: OcrService.DetectionResult,
         val box: android.graphics.Rect,
         val text: String,
-        val color: Int,
-        val backgroundColor: Int
+        val color: Int = Color.BLACK
     )
 
     private data class RgbColor(
@@ -64,34 +68,31 @@ class SceneTextReplacer(
             return frame
         }
 
-        val working = ensureBgr(frame)
+        var working = ensureBgr(frame)
+        val originalBgr = working.clone()
 
         try {
-            val drawItems = collectDrawItems(working, detectionResults, translatedTexts)
-            if (drawItems.isEmpty()) {
+            val baseItems = collectDrawItems(detectionResults, translatedTexts)
+            if (baseItems.isEmpty()) {
                 return working
             }
 
-            drawItems.forEach { item ->
-                val fillColor = toBgrScalar(item.backgroundColor)
-                val polygon = toClampedPolygon(item.result.cornerPoints, working.cols(), working.rows())
-                if (polygon != null) {
-                    Imgproc.fillConvexPoly(working, polygon, fillColor)
-                    polygon.release()
-                } else {
-                    val left = item.box.left.coerceAtLeast(0)
-                    val top = item.box.top.coerceAtLeast(0)
-                    val right = item.box.right.coerceAtMost(working.cols())
-                    val bottom = item.box.bottom.coerceAtMost(working.rows())
-                    Imgproc.rectangle(
-                        working,
-                        Point(left.toDouble(), top.toDouble()),
-                        Point(right.toDouble(), bottom.toDouble()),
-                        fillColor,
-                        -1
-                    )
-                }
+            val inpaintMask = buildInpaintMask(working.cols(), working.rows(), baseItems)
+            if (Core.countNonZero(inpaintMask) > 0) {
+                val inpainted = Mat()
+                Photo.inpaint(
+                    working,
+                    inpaintMask,
+                    inpainted,
+                    TELEA_INPAINT_RADIUS,
+                    Photo.INPAINT_TELEA
+                )
+                working.release()
+                working = inpainted
             }
+            inpaintMask.release()
+
+            val drawItems = applyTextColors(baseItems, originalBgr, working)
 
             Imgproc.cvtColor(working, working, Imgproc.COLOR_BGR2RGB)
             val bitmap = getOrCreateBitmap(working.cols(), working.rows())
@@ -106,6 +107,8 @@ class SceneTextReplacer(
             Imgproc.cvtColor(working, working, Imgproc.COLOR_RGB2BGR)
         } catch (e: Exception) {
             Log.e(TAG, "SceneTextReplacer failed", e)
+        } finally {
+            originalBgr.release()
         }
 
         return working
@@ -123,7 +126,6 @@ class SceneTextReplacer(
     }
 
     private fun collectDrawItems(
-        sourceBgr: Mat,
         detectionResults: List<OcrService.DetectionResult>,
         translatedTexts: List<String>
     ): List<DrawItem> {
@@ -132,12 +134,59 @@ class SceneTextReplacer(
             val text = translatedTexts.getOrNull(index)?.trim().orEmpty()
             val box = result.boundingBox ?: return@forEachIndexed
             if (text.isEmpty()) return@forEachIndexed
-            val backgroundColor = estimateBackgroundColor(sourceBgr, box)
-            val rawTextColor = estimateTextColor(sourceBgr, box)
-            val finalTextColor = enforceTextContrast(rawTextColor, backgroundColor)
-            items.add(DrawItem(result, box, text, finalTextColor, backgroundColor))
+            items.add(DrawItem(result = result, box = box, text = text))
         }
         return items
+    }
+
+    private fun buildInpaintMask(
+        width: Int,
+        height: Int,
+        drawItems: List<DrawItem>
+    ): Mat {
+        val mask = Mat.zeros(height, width, CvType.CV_8UC1)
+        val white = Scalar(255.0)
+
+        drawItems.forEach { item ->
+            val polygon = toClampedPolygon(item.result.cornerPoints, width, height)
+            if (polygon != null) {
+                Imgproc.fillConvexPoly(mask, polygon, white)
+                polygon.release()
+            } else {
+                val left = item.box.left.coerceAtLeast(0)
+                val top = item.box.top.coerceAtLeast(0)
+                val right = item.box.right.coerceAtMost(width)
+                val bottom = item.box.bottom.coerceAtMost(height)
+                Imgproc.rectangle(
+                    mask,
+                    Point(left.toDouble(), top.toDouble()),
+                    Point(right.toDouble(), bottom.toDouble()),
+                    white,
+                    -1
+                )
+            }
+        }
+
+        val kernel = Imgproc.getStructuringElement(
+            Imgproc.MORPH_ELLIPSE,
+            Size(INPAINT_MASK_DILATE_SIZE.toDouble(), INPAINT_MASK_DILATE_SIZE.toDouble())
+        )
+        Imgproc.dilate(mask, mask, kernel)
+        kernel.release()
+        return mask
+    }
+
+    private fun applyTextColors(
+        items: List<DrawItem>,
+        originalBgr: Mat,
+        inpaintedBgr: Mat
+    ): List<DrawItem> {
+        return items.map { item ->
+            val backgroundColor = estimateBackgroundColor(inpaintedBgr, item.box)
+            val rawTextColor = estimateTextColor(originalBgr, item.box)
+            val finalTextColor = enforceTextContrast(rawTextColor, backgroundColor)
+            item.copy(color = finalTextColor)
+        }
     }
 
     private fun enforceTextContrast(textColor: Int, backgroundColor: Int): Int {
@@ -285,14 +334,6 @@ class SceneTextReplacer(
             (sumR / count).toInt().coerceIn(0, 255),
             (sumG / count).toInt().coerceIn(0, 255),
             (sumB / count).toInt().coerceIn(0, 255)
-        )
-    }
-
-    private fun toBgrScalar(color: Int): Scalar {
-        return Scalar(
-            Color.blue(color).toDouble(),
-            Color.green(color).toDouble(),
-            Color.red(color).toDouble()
         )
     }
 

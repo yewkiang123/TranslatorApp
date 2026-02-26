@@ -53,7 +53,7 @@
             android:layout_height="50dp"
             android:layout_marginTop="4dp"
             android:background="@drawable/spinner_bg"
-            android:dropDownWidth="230dp"
+            android:dropDownWidth="260dp"
             android:dropDownVerticalOffset="8dp"
             android:popupBackground="@drawable/spinner_popup_bg"
             app:layout_constraintEnd_toStartOf="@id/controlCenterline"
