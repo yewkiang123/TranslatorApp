@@ -6,6 +6,7 @@ import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
 import android.animation.PropertyValuesHolder
 import android.animation.ValueAnimator
+import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
@@ -63,6 +64,22 @@ import kotlin.math.hypot
 
 
 class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
+    private enum class ProcessingIndicatorState {
+        IDLE,
+        DETECTING,
+        TRANSLATING,
+        GENERATING,
+        DISABLED
+    }
+
+    private data class ProcessingIndicatorStyle(
+        val labelRes: Int,
+        val backgroundColorRes: Int,
+        val textColorRes: Int,
+        val spinnerColorRes: Int,
+        val spinnerVisible: Boolean
+    )
+
     private data class LanguageOption(
         val label: String,
         val code: String
@@ -132,6 +149,12 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private var isFreezeDragging = false
     private var isOpenCvReady = false
     private var hasShownOpenCvUnavailableWarning = false
+    private val processingStateLock = Any()
+    private var detectingActive = false
+    private var translatingJobsInFlight = 0
+    private var generatingJobsInFlight = 0
+    private var generatedTextVisible = false
+    private var lastProcessingIndicatorState: ProcessingIndicatorState? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -141,6 +164,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        renderProcessingIndicator(force = true)
 
         initServices()
         setupOcrListener()
@@ -195,6 +219,135 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 clearTrackingState()
             }
         }.launchIn(lifecycleScope)
+    }
+
+    private fun setDetectingActive(active: Boolean) {
+        synchronized(processingStateLock) {
+            detectingActive = active
+        }
+        renderProcessingIndicator()
+    }
+
+    private fun resetProcessingWork(keepDetecting: Boolean) {
+        synchronized(processingStateLock) {
+            translatingJobsInFlight = 0
+            generatingJobsInFlight = 0
+            generatedTextVisible = false
+            detectingActive = keepDetecting
+        }
+        renderProcessingIndicator(force = true)
+    }
+
+    private fun markTranslationStarted() {
+        synchronized(processingStateLock) {
+            translatingJobsInFlight++
+        }
+        renderProcessingIndicator()
+    }
+
+    private fun markTranslationFinished() {
+        synchronized(processingStateLock) {
+            if (translatingJobsInFlight > 0) {
+                translatingJobsInFlight--
+            }
+        }
+        renderProcessingIndicator()
+    }
+
+    private fun setGeneratingActive(active: Boolean) {
+        synchronized(processingStateLock) {
+            if (active) {
+                generatingJobsInFlight++
+            } else if (generatingJobsInFlight > 0) {
+                generatingJobsInFlight--
+            }
+        }
+        renderProcessingIndicator()
+    }
+
+    private fun setGeneratedTextVisible(visible: Boolean) {
+        synchronized(processingStateLock) {
+            generatedTextVisible = visible
+        }
+        renderProcessingIndicator()
+    }
+
+    private fun resolveProcessingIndicatorState(): ProcessingIndicatorState {
+        return synchronized(processingStateLock) {
+            when {
+                generatedTextVisible -> ProcessingIndicatorState.IDLE
+                !isOpenCvReady -> ProcessingIndicatorState.DISABLED
+                generatingJobsInFlight > 0 -> ProcessingIndicatorState.GENERATING
+                translatingJobsInFlight > 0 -> ProcessingIndicatorState.TRANSLATING
+                detectingActive -> ProcessingIndicatorState.DETECTING
+                else -> ProcessingIndicatorState.IDLE
+            }
+        }
+    }
+
+    private fun styleForProcessingState(state: ProcessingIndicatorState): ProcessingIndicatorStyle {
+        return when (state) {
+            ProcessingIndicatorState.IDLE -> ProcessingIndicatorStyle(
+                labelRes = R.string.status_ready,
+                backgroundColorRes = R.color.status_idle_bg,
+                textColorRes = R.color.status_idle_text,
+                spinnerColorRes = R.color.status_spinner_idle,
+                spinnerVisible = false
+            )
+
+            ProcessingIndicatorState.DETECTING -> ProcessingIndicatorStyle(
+                labelRes = R.string.status_detecting_text,
+                backgroundColorRes = R.color.status_detect_bg,
+                textColorRes = R.color.status_detect_text,
+                spinnerColorRes = R.color.status_spinner_detect,
+                spinnerVisible = true
+            )
+
+            ProcessingIndicatorState.TRANSLATING -> ProcessingIndicatorStyle(
+                labelRes = R.string.status_translating,
+                backgroundColorRes = R.color.status_translate_bg,
+                textColorRes = R.color.status_translate_text,
+                spinnerColorRes = R.color.status_spinner_translate,
+                spinnerVisible = true
+            )
+
+            ProcessingIndicatorState.GENERATING -> ProcessingIndicatorStyle(
+                labelRes = R.string.status_generating_image,
+                backgroundColorRes = R.color.status_generate_bg,
+                textColorRes = R.color.status_generate_text,
+                spinnerColorRes = R.color.status_spinner_generate,
+                spinnerVisible = true
+            )
+
+            ProcessingIndicatorState.DISABLED -> ProcessingIndicatorStyle(
+                labelRes = R.string.status_ocr_disabled,
+                backgroundColorRes = R.color.status_disabled_bg,
+                textColorRes = R.color.status_disabled_text,
+                spinnerColorRes = R.color.status_spinner_idle,
+                spinnerVisible = false
+            )
+        }
+    }
+
+    private fun renderProcessingIndicator(force: Boolean = false) {
+        val state = resolveProcessingIndicatorState()
+        if (!force && state == lastProcessingIndicatorState) return
+        lastProcessingIndicatorState = state
+        val style = styleForProcessingState(state)
+
+        runOnUiThread {
+            binding.processingIndicatorText.setText(style.labelRes)
+            binding.processingIndicatorText.setTextColor(
+                ContextCompat.getColor(this, style.textColorRes)
+            )
+            binding.processingIndicatorCard.setCardBackgroundColor(
+                ContextCompat.getColor(this, style.backgroundColorRes)
+            )
+            binding.processingIndicatorProgress.visibility =
+                if (style.spinnerVisible) View.VISIBLE else View.GONE
+            binding.processingIndicatorProgress.indeterminateTintList =
+                ColorStateList.valueOf(ContextCompat.getColor(this, style.spinnerColorRes))
+        }
     }
 
     private var reusableBitmap: Bitmap? = null
@@ -352,14 +505,26 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             return
         }
 
-        val updated = replacer.replaceText(frame, shifted, snapshot.translations)
-        FrameOcrRepository.updateFrame(updated)
-        updated.release()
-        overlayEnabled = true
-        runOnUiThread {
-            binding.processedOverlay.visibility = View.VISIBLE
+        setGeneratingActive(true)
+        try {
+            val updated = replacer.replaceText(frame, shifted, snapshot.translations)
+            try {
+                FrameOcrRepository.updateFrame(updated)
+            } finally {
+                updated.release()
+            }
+            overlayEnabled = true
+            setGeneratedTextVisible(true)
+            runOnUiThread {
+                binding.processedOverlay.visibility = View.VISIBLE
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed generating processed frame", e)
+            hideOverlayOnly()
+        } finally {
+            setGeneratingActive(false)
+            frame.release()
         }
-        frame.release()
     }
 
     private fun hideOverlayOnly() {
@@ -367,6 +532,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         if (!overlayEnabled) return
 
         overlayEnabled = false
+        setGeneratedTextVisible(false)
         FrameOcrRepository.clearFrame()
         runOnUiThread {
             binding.processedOverlay.setImageBitmap(null)
@@ -549,6 +715,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         translationCache.clear()
         FrameOcrRepository.clearFrame()
         overlayEnabled = false
+        setGeneratedTextVisible(false)
         runOnUiThread {
             binding.processedOverlay.setImageBitmap(null)
             binding.processedOverlay.visibility = View.INVISIBLE
@@ -563,6 +730,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         clearTrackingState()
         ocrService.resetSessionState()
         lastProcessTime = 0L
+        resetProcessingWork(keepDetecting = !freezeFrameMode && isOpenCvReady)
     }
     private fun processOnInterval(results: List<OcrService.DetectionResult>) {
         if (freezeFrameMode) return
@@ -615,23 +783,34 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
         pendingBatches.forEach { (sourceLanguage, batch) ->
             val batchTexts = batch.map { it.second }
-            translationService.translateBatch(
-                texts = batchTexts,
-                sourceLanguage = sourceLanguage,
-                targetLanguage = targetLanguage,
-                onSuccess = { translatedBatch ->
-                    val count = minOf(batch.size, translatedBatch.size)
-                    for (i in 0 until count) {
-                        val (index, originalText) = batch[i]
-                        val translated = translatedBatch[i]
-                        translationCache[originalText] = translated
-                        applyTranslationResult(index, translated, translatedTexts)
+            markTranslationStarted()
+            try {
+                translationService.translateBatch(
+                    texts = batchTexts,
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
+                    onSuccess = { translatedBatch ->
+                        try {
+                            val count = minOf(batch.size, translatedBatch.size)
+                            for (i in 0 until count) {
+                                val (index, originalText) = batch[i]
+                                val translated = translatedBatch[i]
+                                translationCache[originalText] = translated
+                                applyTranslationResult(index, translated, translatedTexts)
+                            }
+                        } finally {
+                            markTranslationFinished()
+                        }
+                    },
+                    onError = { error ->
+                        Log.e(TAG, "Batch translation failed for $sourceLanguage->$targetLanguage", error)
+                        markTranslationFinished()
                     }
-                },
-                onError = { error ->
-                    Log.e(TAG, "Batch translation failed for $sourceLanguage->$targetLanguage", error)
-                }
-            )
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Batch translation setup failed for $sourceLanguage->$targetLanguage", e)
+                markTranslationFinished()
+            }
         }
     }
 
@@ -967,6 +1146,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private fun startCameraWithOcr() {
         if (!isOpenCvReady) {
             cameraController.startCamera()
+            setDetectingActive(false)
             if (!hasShownOpenCvUnavailableWarning) {
                 hasShownOpenCvUnavailableWarning = true
                 Toast.makeText(
@@ -979,6 +1159,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             return
         }
         cameraController.startCamera(ocrService)
+        setDetectingActive(true)
     }
 
     private fun setupClickListeners() {
@@ -1093,6 +1274,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
                 freezeFrameMode = true
                 cameraController.stopCamera()
+                resetProcessingWork(keepDetecting = false)
                 frozenFrameBitmap?.recycle()
                 frozenFrameBitmap = frozenBitmap
 
