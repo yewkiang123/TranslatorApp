@@ -31,7 +31,6 @@ class SceneTextReplacer(
         private const val INPAINT_MASK_DILATE_SIZE = 3
         private const val GENERATED_TEXT_SCALE = 0.8f
         private const val ANGLE_SNAP_DEGREES = 1.25f
-        private const val MIN_TEXT_BACKGROUND_DISTANCE = 48.0
         private const val COLOR_SWITCH_HYSTERESIS = 36.0
         private const val COLOR_HISTORY_LIMIT = 256
     }
@@ -254,16 +253,8 @@ class SceneTextReplacer(
         }
     }
 
-    private fun enforceTextContrast(textColor: Int, backgroundColor: Int): Int {
-        val distance = colorDistance(textColor, backgroundColor)
-        if (distance >= MIN_TEXT_BACKGROUND_DISTANCE) return textColor
-
-        val bgLuma = luminance(backgroundColor)
-        return if (bgLuma >= 140.0) {
-            Color.rgb(20, 20, 20)
-        } else {
-            Color.rgb(235, 235, 235)
-        }
+    private fun enforceTextContrast(textColor: Int, _backgroundColor: Int): Int {
+        return textColor
     }
 
     private fun luminance(color: Int): Double {
