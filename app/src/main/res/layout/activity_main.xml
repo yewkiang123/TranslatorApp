@@ -25,17 +25,15 @@
             android:layout_height="match_parent"
             android:background="@android:color/white"
             app:implementationMode="compatible"
-            app:scaleType="fitCenter" >
-
-            <ImageView
-                android:id="@+id/processedOverlay"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:background="@android:color/white"
-                android:scaleType="fitCenter" />
-        </androidx.camera.view.PreviewView>
+            app:scaleType="fitCenter" />
 
         <!-- Processed Frame Overlay -->
+        <ImageView
+            android:id="@+id/processedOverlay"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@android:color/white"
+            android:scaleType="fitCenter" />
 
         <com.google.android.material.card.MaterialCardView
             android:id="@+id/processingIndicatorCard"
