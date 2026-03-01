@@ -5,7 +5,7 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@android:color/white"
+    android:background="#F7F8FA"
     tools:context=".MainActivity">
 
     <FrameLayout
@@ -40,7 +40,7 @@
     <androidx.constraintlayout.widget.ConstraintLayout
         android:id="@+id/controlPanel"
         android:layout_width="0dp"
-        android:layout_height="180dp"
+        android:layout_height="250dp"
         android:background="#F7F8FA"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
@@ -51,13 +51,13 @@
             android:id="@+id/sourceLanguage"
             android:layout_width="138dp"
             android:layout_height="50dp"
-            android:layout_marginTop="4dp"
+            android:layout_marginTop="64dp"
             android:background="@drawable/spinner_bg"
             android:dropDownWidth="260dp"
             android:dropDownVerticalOffset="8dp"
             android:popupBackground="@drawable/spinner_popup_bg"
             app:layout_constraintEnd_toStartOf="@id/controlCenterline"
-            app:layout_constraintHorizontal_bias="0.488"
+            app:layout_constraintHorizontal_bias="0.485"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toTopOf="parent" />
 
@@ -65,13 +65,13 @@
             android:id="@+id/targetLanguage"
             android:layout_width="138dp"
             android:layout_height="50dp"
-            android:layout_marginTop="4dp"
+            android:layout_marginTop="64dp"
             android:background="@drawable/spinner_bg"
             android:dropDownWidth="260dp"
             android:dropDownVerticalOffset="8dp"
             android:popupBackground="@drawable/spinner_popup_bg"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintHorizontal_bias="0.505"
+            app:layout_constraintHorizontal_bias="0.522"
             app:layout_constraintStart_toEndOf="@id/controlCenterline"
             app:layout_constraintTop_toTopOf="parent" />
 

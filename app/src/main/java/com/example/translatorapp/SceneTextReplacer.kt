@@ -32,9 +32,12 @@ class SceneTextReplacer(
         private const val GENERATED_TEXT_SCALE = 0.8f
         private const val ANGLE_SNAP_DEGREES = 1.25f
         private const val MIN_TEXT_BACKGROUND_DISTANCE = 48.0
+        private const val COLOR_SWITCH_HYSTERESIS = 36.0
+        private const val COLOR_HISTORY_LIMIT = 256
     }
 
     private data class DrawItem(
+        val stableKey: String,
         val result: OcrService.DetectionResult,
         val box: android.graphics.Rect,
         val text: String,
@@ -58,6 +61,7 @@ class SceneTextReplacer(
         hinting = Paint.HINTING_ON
     }
     private val textBounds = android.graphics.Rect()
+    private val stableTextColors = LinkedHashMap<String, Int>()
 
     fun replaceText(
         frame: Mat,
@@ -74,8 +78,10 @@ class SceneTextReplacer(
         try {
             val baseItems = collectDrawItems(detectionResults, translatedTexts)
             if (baseItems.isEmpty()) {
+                stableTextColors.clear()
                 return working
             }
+            retainOnlyActiveColorKeys(baseItems.mapTo(HashSet()) { it.stableKey })
 
             val inpaintMask = buildInpaintMask(working.cols(), working.rows(), baseItems)
             if (Core.countNonZero(inpaintMask) > 0) {
@@ -134,7 +140,14 @@ class SceneTextReplacer(
             val text = translatedTexts.getOrNull(index)?.trim().orEmpty()
             val box = result.boundingBox ?: return@forEachIndexed
             if (text.isEmpty()) return@forEachIndexed
-            items.add(DrawItem(result = result, box = box, text = text))
+            items.add(
+                DrawItem(
+                    stableKey = "$index:${text.hashCode()}",
+                    result = result,
+                    box = box,
+                    text = text
+                )
+            )
         }
         return items
     }
@@ -184,8 +197,60 @@ class SceneTextReplacer(
         return items.map { item ->
             val backgroundColor = estimateBackgroundColor(inpaintedBgr, item.box)
             val rawTextColor = estimateTextColor(originalBgr, item.box)
-            val finalTextColor = enforceTextContrast(rawTextColor, backgroundColor)
+            val contrasted = enforceTextContrast(rawTextColor, backgroundColor)
+            val finalTextColor = stabilizeTextColor(item.stableKey, contrasted, backgroundColor)
             item.copy(color = finalTextColor)
+        }
+    }
+
+    private fun retainOnlyActiveColorKeys(activeKeys: Set<String>) {
+        if (stableTextColors.isEmpty()) return
+        val iterator = stableTextColors.keys.iterator()
+        while (iterator.hasNext()) {
+            val key = iterator.next()
+            if (!activeKeys.contains(key)) {
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun stabilizeTextColor(
+        key: String,
+        candidate: Int,
+        backgroundColor: Int
+    ): Int {
+        val previous = stableTextColors[key]
+        val stabilized = if (previous == null) {
+            candidate
+        } else {
+            val previousDistance = colorDistance(previous, backgroundColor)
+            val candidateDistance = colorDistance(candidate, backgroundColor)
+            val previousTone = toneBucket(previous)
+            val candidateTone = toneBucket(candidate)
+
+            if (previousTone != candidateTone &&
+                candidateDistance < previousDistance + COLOR_SWITCH_HYSTERESIS
+            ) {
+                previous
+            } else {
+                candidate
+            }
+        }
+
+        stableTextColors[key] = stabilized
+        while (stableTextColors.size > COLOR_HISTORY_LIMIT) {
+            val firstKey = stableTextColors.entries.firstOrNull()?.key ?: break
+            stableTextColors.remove(firstKey)
+        }
+        return stabilized
+    }
+
+    private fun toneBucket(color: Int): Int {
+        val luma = luminance(color)
+        return when {
+            luma >= 170.0 -> 1
+            luma <= 85.0 -> -1
+            else -> 0
         }
     }
 
@@ -412,8 +477,8 @@ class SceneTextReplacer(
         }
 
         if (darkCount == 0 && lightCount == 0) return Color.BLACK
-        if (darkCount == 0) return Color.rgb(20, 20, 20)
-        if (lightCount == 0) return Color.rgb(235, 235, 235)
+        if (darkCount == 0) return Color.rgb(235, 235, 235)
+        if (lightCount == 0) return Color.rgb(20, 20, 20)
 
         val textFromDark = darkCount < lightCount
         val selected = if (textFromDark) {

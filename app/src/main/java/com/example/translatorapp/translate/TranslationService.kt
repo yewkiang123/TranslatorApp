@@ -6,13 +6,30 @@ import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslateRemoteModel
+import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 
 class TranslationService {
 
+    private data class TranslatorKey(
+        val sourceLanguage: String,
+        val targetLanguage: String
+    )
+
+    private data class TranslatorEntry(
+        val translator: Translator,
+        var modelReady: Boolean = false
+    )
+
     private val tag = "TranslationService"
     private val languageIdentifier = LanguageIdentification.getClient()
     private val modelManager = RemoteModelManager.getInstance()
+    private val downloadConditions = DownloadConditions.Builder()
+        .requireWifi()
+        .build()
+    private val translatorLock = Any()
+    private val translators = HashMap<TranslatorKey, TranslatorEntry>()
+    private val pendingDownloads = HashMap<TranslatorKey, com.google.android.gms.tasks.Task<Void>>()
 
     fun translate(
         text: String,
@@ -35,6 +52,30 @@ class TranslationService {
         }
     }
 
+    fun translateBatch(
+        texts: List<String>,
+        sourceLanguage: String,
+        targetLanguage: String,
+        onSuccess: (List<String>) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        if (texts.isEmpty()) {
+            onSuccess(emptyList())
+            return
+        }
+        if (sourceLanguage == "auto") {
+            onError(IllegalArgumentException("Batch translation requires explicit source language"))
+            return
+        }
+        translateTextsWithLanguage(
+            texts = texts,
+            sourceLanguage = sourceLanguage,
+            targetLanguage = targetLanguage,
+            onSuccess = onSuccess,
+            onError = onError
+        )
+    }
+
     private fun translateWithLanguage(
         text: String,
         sourceLanguage: String,
@@ -42,10 +83,58 @@ class TranslationService {
         onSuccess: (String) -> Unit,
         onError: (Exception) -> Unit
     ) {
-        // Check if source and target are the same
+        translateTextsWithLanguage(
+            texts = listOf(text),
+            sourceLanguage = sourceLanguage,
+            targetLanguage = targetLanguage,
+            onSuccess = { translated ->
+                onSuccess(translated.firstOrNull() ?: text)
+            },
+            onError = onError
+        )
+    }
+
+    private fun translateTextsWithLanguage(
+        texts: List<String>,
+        sourceLanguage: String,
+        targetLanguage: String,
+        onSuccess: (List<String>) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
         if (sourceLanguage == targetLanguage) {
-            onSuccess(text) // Return original text
+            onSuccess(texts)
             return
+        }
+
+        val (key, entry) = getOrCreateTranslator(sourceLanguage, targetLanguage)
+        ensureModelDownloaded(
+            key = key,
+            entry = entry,
+            onReady = {
+                translateSequentially(
+                    translator = entry.translator,
+                    texts = texts,
+                    index = 0,
+                    translated = MutableList(texts.size) { "" },
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
+                    onSuccess = onSuccess,
+                    onError = onError
+                )
+            },
+            onError = onError
+        )
+    }
+
+    private fun getOrCreateTranslator(
+        sourceLanguage: String,
+        targetLanguage: String
+    ): Pair<TranslatorKey, TranslatorEntry> {
+        val key = TranslatorKey(sourceLanguage, targetLanguage)
+        synchronized(translatorLock) {
+            translators[key]?.let { cached ->
+                return key to cached
+            }
         }
 
         val options = TranslatorOptions.Builder()
@@ -53,30 +142,101 @@ class TranslationService {
             .setTargetLanguage(targetLanguage)
             .build()
 
-        val translator = Translation.getClient(options)
+        val created = TranslatorEntry(translator = Translation.getClient(options))
+        synchronized(translatorLock) {
+            val existing = translators[key]
+            if (existing != null) {
+                created.translator.close()
+                return key to existing
+            }
+            translators[key] = created
+            return key to created
+        }
+    }
 
-        val conditions = DownloadConditions.Builder()
-            .requireWifi()
-            .build()
+    private fun ensureModelDownloaded(
+        key: TranslatorKey,
+        entry: TranslatorEntry,
+        onReady: () -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        val existingTask: com.google.android.gms.tasks.Task<Void>? = synchronized(translatorLock) {
+            if (entry.modelReady) {
+                return onReady()
+            }
+            pendingDownloads[key]?.let { return@synchronized it }
 
-        translator.downloadModelIfNeeded(conditions)
-            .addOnSuccessListener {
-                translator.translate(text)
-                    .addOnSuccessListener { translatedText ->
-                        Log.d(tag, "Translated from $sourceLanguage to $targetLanguage: $translatedText")
-                        onSuccess(translatedText)
-                        translator.close()
-                    }
-                    .addOnFailureListener { e ->
-                        Log.e(tag, "Error translating text", e)
-                        onError(e)
-                        translator.close()
-                    }
+            entry.translator.downloadModelIfNeeded(downloadConditions).also { task ->
+                pendingDownloads[key] = task
+            }
+        }
+
+        existingTask
+            ?.addOnSuccessListener {
+                synchronized(translatorLock) {
+                    entry.modelReady = true
+                    pendingDownloads.remove(key)
+                }
+                onReady()
+            }
+            ?.addOnFailureListener { e ->
+                synchronized(translatorLock) {
+                    pendingDownloads.remove(key)
+                }
+                Log.e(tag, "Error downloading model for ${key.sourceLanguage}->${key.targetLanguage}", e)
+                onError(e)
+            }
+    }
+
+    private fun translateSequentially(
+        translator: Translator,
+        texts: List<String>,
+        index: Int,
+        translated: MutableList<String>,
+        sourceLanguage: String,
+        targetLanguage: String,
+        onSuccess: (List<String>) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        if (index >= texts.size) {
+            onSuccess(translated.toList())
+            return
+        }
+
+        val text = texts[index]
+        if (text.isBlank()) {
+            translated[index] = text
+            translateSequentially(
+                translator = translator,
+                texts = texts,
+                index = index + 1,
+                translated = translated,
+                sourceLanguage = sourceLanguage,
+                targetLanguage = targetLanguage,
+                onSuccess = onSuccess,
+                onError = onError
+            )
+            return
+        }
+
+        translator.translate(text)
+            .addOnSuccessListener { translatedText ->
+                Log.d(tag, "Translated from $sourceLanguage to $targetLanguage: $translatedText")
+                translated[index] = translatedText
+                translateSequentially(
+                    translator = translator,
+                    texts = texts,
+                    index = index + 1,
+                    translated = translated,
+                    sourceLanguage = sourceLanguage,
+                    targetLanguage = targetLanguage,
+                    onSuccess = onSuccess,
+                    onError = onError
+                )
             }
             .addOnFailureListener { e ->
-                Log.e(tag, "Error downloading model", e)
+                Log.e(tag, "Error translating text", e)
                 onError(e)
-                translator.close()
             }
     }
 
@@ -130,5 +290,16 @@ class TranslationService {
                 Log.e(tag, "Failed downloading model: $languageCode", e)
                 onError(e)
             }
+    }
+
+    fun cleanup() {
+        val translatorsToClose = synchronized(translatorLock) {
+            val clients = translators.values.map { it.translator }
+            translators.clear()
+            pendingDownloads.clear()
+            clients
+        }
+        translatorsToClose.forEach { it.close() }
+        languageIdentifier.close()
     }
 }

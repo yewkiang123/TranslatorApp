@@ -55,10 +55,13 @@ class OcrService : ImageAnalysis.Analyzer {
     private var lastStableState: Boolean? = null
     @Volatile private var ocrArmed = true
     @Volatile private var ocrInFlight = false
+    @Volatile private var sourceLanguageHint = "auto"
+    @Volatile private var sessionResetRequested = false
     private var preferredRecognizer = "latin"
     var ocrBurstFrames = 2
     private var ocrFramesProcessed = 0
     var recognizerTimeoutMs = 900L
+    var earlyExitMinLines = 2
 
     var motionThreshold = 10.5
     var stableHoldMs = 1200L
@@ -75,6 +78,7 @@ class OcrService : ImageAnalysis.Analyzer {
         // Rotate Mat so it matches ML Kit bounding boxes
         val rotation = imageProxy.imageInfo.rotationDegrees
         fullMat = rotateMat(fullMat, rotation)
+        applyPendingSessionReset()
 
         // Always publish the latest raw camera frame
         FrameOcrRepository.updateLatestCameraFrame(fullMat)
@@ -110,23 +114,25 @@ class OcrService : ImageAnalysis.Analyzer {
         scope.launch {
             try {
                 val results = mutableListOf<DetectionResult>()
+                val recognizerHitCounts = HashMap<String, Int>()
 
                 val orderedRecognizers = buildRecognizerOrder()
-                for (lang in orderedRecognizers) {
+                val isAutoSource = sourceLanguageHint == "auto"
+                for ((index, lang) in orderedRecognizers.withIndex()) {
                     val recognizer = recognizers[lang] ?: continue
-                    var recognizerFoundText = false
+                    var recognizerFoundCount = 0
                     try {
                         val textResult = withTimeout(recognizerTimeoutMs) {
                             recognizer.process(image).await()
                         }
 
                         for (block in textResult.textBlocks) {
-                            for (line in block.lines) { // ✅ capture each line separately
+                            for (line in block.lines) {
                                 val box = line.boundingBox ?: continue
                                 if (isDuplicateBox(box)) continue
 
                                 seenBoxes.add(box)
-                                recognizerFoundText = true
+                                recognizerFoundCount++
 
                                 results.add(
                                     DetectionResult(
@@ -143,10 +149,20 @@ class OcrService : ImageAnalysis.Analyzer {
                         Log.e("OCR", "Recognizer $lang failed", e)
                     }
 
-                    if (recognizerFoundText) {
-                        preferredRecognizer = lang
+                    if (recognizerFoundCount > 0) {
+                        recognizerHitCounts[lang] = recognizerFoundCount
+                    }
+
+                    if (isAutoSource &&
+                        index == 0 &&
+                        recognizerFoundCount >= earlyExitMinLines
+                    ) {
                         break
                     }
+                }
+
+                if (recognizerHitCounts.isNotEmpty()) {
+                    preferredRecognizer = recognizerHitCounts.maxByOrNull { it.value }?.key ?: preferredRecognizer
                 }
 
                 if (results.isNotEmpty()) {
@@ -170,7 +186,39 @@ class OcrService : ImageAnalysis.Analyzer {
         }
     }
 
+    fun setSourceLanguageHint(languageCode: String) {
+        sourceLanguageHint = languageCode.trim().lowercase().ifBlank { "auto" }
+    }
+
+    private fun applyPendingSessionReset() {
+        if (!sessionResetRequested) return
+        sessionResetRequested = false
+        seenBoxes.clear()
+        prevGraySmall?.release()
+        prevGraySmall = null
+        lastMotionTimeMs = 0L
+        unstableSinceMs = 0L
+        lastStableState = null
+        ocrArmed = true
+        ocrFramesProcessed = 0
+        preferredRecognizer = languageCodeToRecognizer(sourceLanguageHint)
+    }
+
+    private fun languageCodeToRecognizer(languageCode: String): String {
+        return when {
+            languageCode.startsWith("zh") -> "zh"
+            languageCode.startsWith("ja") -> "ja"
+            languageCode.startsWith("ko") -> "ko"
+            else -> "latin"
+        }
+    }
+
     private fun buildRecognizerOrder(): List<String> {
+        val sourceHint = sourceLanguageHint
+        if (sourceHint != "auto") {
+            return listOf(languageCodeToRecognizer(sourceHint))
+        }
+
         if (!recognizers.containsKey(preferredRecognizer)) {
             preferredRecognizer = "latin"
         }
@@ -293,6 +341,10 @@ class OcrService : ImageAnalysis.Analyzer {
     }
     fun resetCache() {
         seenBoxes.clear()
+    }
+
+    fun resetSessionState() {
+        sessionResetRequested = true
     }
 
     fun cleanup() {

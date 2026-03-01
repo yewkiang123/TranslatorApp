@@ -130,12 +130,14 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private var lastTouchX = 0f
     private var lastTouchY = 0f
     private var isFreezeDragging = false
+    private var isOpenCvReady = false
+    private var hasShownOpenCvUnavailableWarning = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         // Initialize OpenCV FIRST before anything else
-        initializeOpenCV()
+        isOpenCvReady = initializeOpenCV()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -157,23 +159,27 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
     }
 
-    private fun initializeOpenCV() {
+    private fun initializeOpenCV(): Boolean {
         try {
             // Try to load OpenCV
             if (!org.opencv.android.OpenCVLoader.initDebug()) {
                 Log.e("OpenCV", "OpenCV initialization failed!")
                 Toast.makeText(this, "OpenCV failed to load", Toast.LENGTH_SHORT).show()
+                return false
             } else {
                 Log.d("OpenCV", "OpenCV initialized successfully")
+                return true
             }
         } catch (e: UnsatisfiedLinkError) {
             Log.e("OpenCV", "OpenCV library not found", e)
             Toast.makeText(this, "OpenCV library missing", Toast.LENGTH_LONG).show()
+            return false
         }
     }
 
     private fun initServices() {
         ocrService = OcrService()
+        ocrService.setSourceLanguageHint("auto")
         translationService = TranslationService()
     }
 
@@ -200,8 +206,8 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         renderJob = lifecycleScope.launch {
             FrameOcrRepository.currentFrame
                 .filterNotNull()
-                .conflate() // keep only the latest if we're slow
-                .collectLatest { mat ->  // CANCEL previous render if a new frame arrives
+                .conflate()
+                .collectLatest { mat ->
 
                     if (mat.empty()) return@collectLatest
                     if (freezeFrameMode) return@collectLatest
@@ -549,17 +555,14 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
     }
     private fun clearDetectedBlocks() {
+        resetDetectionSession()
+        Log.d(TAG, "Reset detection session due to language change")
+    }
 
-        // 1️⃣ Clear OCR detection cache
-        ocrService.resetCache()
-
-        // 2️⃣ Clear displayed frame
-        FrameOcrRepository.clearFrame()
-
-        // 3️⃣ Force immediate reprocessing
+    private fun resetDetectionSession() {
+        clearTrackingState()
+        ocrService.resetSessionState()
         lastProcessTime = 0L
-
-        Log.d(TAG, "Cleared detected blocks due to language change")
     }
     private fun processOnInterval(results: List<OcrService.DetectionResult>) {
         if (freezeFrameMode) return
@@ -577,7 +580,6 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             return
         }
 
-        // Make mutable translated list
         val translatedTexts = MutableList(results.size) { "" }
         val anchorGray = toGray(baseFrame)
 
@@ -589,75 +591,62 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             lastTrackingTransform = TrackingTransform()
         }
 
+        val selectedSourceCode = getLanguageCode(sourceLanguageDisplay)
+        val targetLanguage = targetLanguageCode
+        val pendingBatches = HashMap<String, MutableList<Pair<Int, String>>>()
+
         results.forEachIndexed { index, result ->
+            val text = result.text
 
-            // Skip if cached
-            translationCache[result.text]?.let { cached ->
-
-                if (index < translatedTexts.size) {
-                    translatedTexts[index] = cached
-                } else {
-                    return@forEachIndexed
-                }
-
-                synchronized(trackingLock) {
-                    if (index < trackedTranslations.size) {
-                        trackedTranslations[index] = cached
-                    }
-                }
-
+            translationCache[text]?.let { cached ->
+                applyTranslationResult(index, cached, translatedTexts)
                 return@forEachIndexed
             }
 
-            // Launch translation WITHOUT blocking
-            lifecycleScope.launch(Dispatchers.IO) {
-
-                translateText(result.text, result.language) { translated ->
-
-                    translationCache[result.text] = translated
-                    if (index >= translatedTexts.size) return@translateText
-                    translatedTexts[index] = translated
-
-                    synchronized(trackingLock) {
-                        if (index < trackedTranslations.size) {
-                            trackedTranslations[index] = translated
-                        }
-                    }
-                }
-
+            val sourceLanguage = LanguageUiLogic.resolveSourceLanguage(selectedSourceCode, result.language)
+            if (LanguageUiLogic.shouldBypassTranslation(sourceLanguage, targetLanguage, text)) {
+                applyTranslationResult(index, text, translatedTexts)
+                return@forEachIndexed
             }
+
+            pendingBatches.getOrPut(sourceLanguage) { mutableListOf() }
+                .add(index to text)
         }
 
+        pendingBatches.forEach { (sourceLanguage, batch) ->
+            val batchTexts = batch.map { it.second }
+            translationService.translateBatch(
+                texts = batchTexts,
+                sourceLanguage = sourceLanguage,
+                targetLanguage = targetLanguage,
+                onSuccess = { translatedBatch ->
+                    val count = minOf(batch.size, translatedBatch.size)
+                    for (i in 0 until count) {
+                        val (index, originalText) = batch[i]
+                        val translated = translatedBatch[i]
+                        translationCache[originalText] = translated
+                        applyTranslationResult(index, translated, translatedTexts)
+                    }
+                },
+                onError = { error ->
+                    Log.e(TAG, "Batch translation failed for $sourceLanguage->$targetLanguage", error)
+                }
+            )
+        }
     }
 
-    // Rendering is handled in trackAndRender using tracked patches + translations.
-
-    private fun translateText(
+    private fun applyTranslationResult(
+        index: Int,
         text: String,
-        detectedLanguage: String,
-        onResult: (String) -> Unit
+        translatedTexts: MutableList<String>
     ) {
-        val selectedSourceCode = getLanguageCode(sourceLanguageDisplay)
-        val sourceLang = LanguageUiLogic.resolveSourceLanguage(selectedSourceCode, detectedLanguage)
-
-        if (LanguageUiLogic.shouldBypassTranslation(sourceLang, targetLanguageCode, text)) {
-            showToast("Languages are same:\n$text")
-            onResult(text)   // still return something
-            return
-        }
-
-        translationService.translate(
-            text = text,
-            sourceLanguage = sourceLang,
-            targetLanguage = targetLanguageCode,
-            onSuccess = { translated ->
-                showToast("Translated: $translated")
-                onResult(translated)      // ✅ send result back
-            },
-            onError = { error ->
-                Log.e("Translation", "Failed", error)
+        if (index >= translatedTexts.size) return
+        translatedTexts[index] = text
+        synchronized(trackingLock) {
+            if (trackedTranslations === translatedTexts && index < trackedTranslations.size) {
+                trackedTranslations[index] = text
             }
-        )
+        }
     }
 
 
@@ -711,6 +700,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         val sourceDetectedIndex = sourceLanguageOptions.indexOfFirst { it.code == "auto" }.coerceAtLeast(0)
         binding.targetLanguage.setSelection(targetEnglishIndex)
         binding.sourceLanguage.setSelection(sourceDetectedIndex)
+        updateOcrSourceLanguageHint()
 
         refreshDownloadedLanguageStatus()
     }
@@ -735,6 +725,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 if (selected != sourceLanguageDisplay) {
 
                     sourceLanguageDisplay = selected
+                    updateOcrSourceLanguageHint()
 
                     clearDetectedBlocks()
 
@@ -747,12 +738,20 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     override fun onNothingSelected(parent: AdapterView<*>) {
         when (parent.id) {
             R.id.targetLanguage -> targetLanguageCode = "en"
-            R.id.sourceLanguage -> sourceLanguageDisplay = "Detected Language"
+            R.id.sourceLanguage -> {
+                sourceLanguageDisplay = "Detected Language"
+                updateOcrSourceLanguageHint()
+            }
         }
     }
 
     private fun getLanguageCode(displayName: String): String {
         return languageCodeByDisplay[displayName] ?: "en"
+    }
+
+    private fun updateOcrSourceLanguageHint() {
+        val sourceCode = getLanguageCode(sourceLanguageDisplay)
+        ocrService.setSourceLanguageHint(sourceCode)
     }
 
     private fun buildLanguageLabel(code: String, usedLabels: MutableSet<String>): String {
@@ -966,6 +965,19 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun startCameraWithOcr() {
+        if (!isOpenCvReady) {
+            cameraController.startCamera()
+            if (!hasShownOpenCvUnavailableWarning) {
+                hasShownOpenCvUnavailableWarning = true
+                Toast.makeText(
+                    this,
+                    "OpenCV unavailable: camera preview only, OCR disabled",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            Log.e(TAG, "Skipping OCR analyzer because OpenCV is not ready")
+            return
+        }
         cameraController.startCamera(ocrService)
     }
 
@@ -1097,9 +1109,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         if (!freezeFrameMode) return
 
         freezeFrameMode = false
-        clearTrackingState()
-        ocrService.resetCache()
-        lastProcessTime = 0L
+        resetDetectionSession()
         frozenFrameBitmap?.recycle()
         frozenFrameBitmap = null
         resetFreezeState()
@@ -1240,6 +1250,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         super.onDestroy()
         cameraController.stopCamera()
         ocrService.cleanup()
+        translationService.cleanup()
         trackingJob?.cancel()
         synchronized(trackingLock) {
             trackingAnchorGray?.release()
