@@ -490,7 +490,20 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             } else {
                 null
             }
-            result.copy(boundingBox = shiftedBox, cornerPoints = shiftedCorners)
+            val shiftedBlockBox = result.blockBoundingBox?.let { block ->
+                shiftRect(block, transform, frame.cols(), frame.rows())
+            }
+            val shiftedBlockCorners = if (shiftedBlockBox != null) {
+                shiftPoints(result.blockCornerPoints, transform, frame.cols(), frame.rows())
+            } else {
+                null
+            }
+            result.copy(
+                boundingBox = shiftedBox,
+                cornerPoints = shiftedCorners,
+                blockBoundingBox = shiftedBlockBox,
+                blockCornerPoints = shiftedBlockCorners
+            )
         }
 
         if (shifted.none { it.boundingBox != null }) {

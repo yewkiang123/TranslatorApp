@@ -43,6 +43,11 @@ class SceneTextReplacer(
         val color: Int = Color.BLACK
     )
 
+    private data class InpaintRegion(
+        val box: android.graphics.Rect,
+        val cornerPoints: Array<android.graphics.Point>? = null
+    )
+
     private data class RgbColor(
         val r: Double,
         val g: Double,
@@ -82,7 +87,8 @@ class SceneTextReplacer(
             }
             retainOnlyActiveColorKeys(baseItems.mapTo(HashSet()) { it.stableKey })
 
-            val inpaintMask = buildInpaintMask(working.cols(), working.rows(), baseItems)
+            val inpaintRegions = collectInpaintRegions(baseItems)
+            val inpaintMask = buildInpaintMask(working.cols(), working.rows(), inpaintRegions)
             if (Core.countNonZero(inpaintMask) > 0) {
                 val inpainted = Mat()
                 Photo.inpaint(
@@ -151,24 +157,57 @@ class SceneTextReplacer(
         return items
     }
 
+    private fun collectInpaintRegions(drawItems: List<DrawItem>): List<InpaintRegion> {
+        val regions = ArrayList<InpaintRegion>(drawItems.size)
+        val seen = HashSet<String>(drawItems.size)
+
+        drawItems.forEach { item ->
+            val regionBox = item.result.blockBoundingBox ?: item.box
+            val regionCorners = item.result.blockCornerPoints ?: item.result.cornerPoints
+            val key = buildRegionKey(regionBox, regionCorners)
+            if (!seen.add(key)) return@forEach
+            regions.add(
+                InpaintRegion(
+                    box = regionBox,
+                    cornerPoints = regionCorners
+                )
+            )
+        }
+
+        return regions
+    }
+
+    private fun buildRegionKey(
+        box: android.graphics.Rect,
+        cornerPoints: Array<android.graphics.Point>?
+    ): String {
+        if (cornerPoints != null && cornerPoints.size >= 3) {
+            val pointsKey = cornerPoints.joinToString(separator = ";") { point ->
+                "${point.x}_${point.y}"
+            }
+            return "poly:$pointsKey"
+        }
+        return "rect:${box.left}_${box.top}_${box.right}_${box.bottom}"
+    }
+
     private fun buildInpaintMask(
         width: Int,
         height: Int,
-        drawItems: List<DrawItem>
+        regions: List<InpaintRegion>
     ): Mat {
         val mask = Mat.zeros(height, width, CvType.CV_8UC1)
         val white = Scalar(255.0)
 
-        drawItems.forEach { item ->
-            val polygon = toClampedPolygon(item.result.cornerPoints, width, height)
+        regions.forEach { region ->
+            val polygon = toClampedPolygon(region.cornerPoints, width, height)
             if (polygon != null) {
                 Imgproc.fillConvexPoly(mask, polygon, white)
                 polygon.release()
             } else {
-                val left = item.box.left.coerceAtLeast(0)
-                val top = item.box.top.coerceAtLeast(0)
-                val right = item.box.right.coerceAtMost(width)
-                val bottom = item.box.bottom.coerceAtMost(height)
+                val left = region.box.left.coerceAtLeast(0)
+                val top = region.box.top.coerceAtLeast(0)
+                val right = region.box.right.coerceAtMost(width)
+                val bottom = region.box.bottom.coerceAtMost(height)
                 Imgproc.rectangle(
                     mask,
                     Point(left.toDouble(), top.toDouble()),

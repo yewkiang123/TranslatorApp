@@ -32,6 +32,8 @@ class OcrService : ImageAnalysis.Analyzer {
         val text: String,
         val boundingBox: Rect?,
         val cornerPoints: Array<android.graphics.Point>? = null,
+        val blockBoundingBox: Rect? = null,
+        val blockCornerPoints: Array<android.graphics.Point>? = null,
         val roiMat: Mat? = null
     )
 
@@ -127,6 +129,8 @@ class OcrService : ImageAnalysis.Analyzer {
                         }
 
                         for (block in textResult.textBlocks) {
+                            val blockBox = block.boundingBox
+                            val blockCorners = block.cornerPoints
                             for (line in block.lines) {
                                 val box = line.boundingBox ?: continue
                                 if (isDuplicateBox(box)) continue
@@ -139,7 +143,9 @@ class OcrService : ImageAnalysis.Analyzer {
                                         language = lang,
                                         text = line.text,
                                         boundingBox = box,
-                                        cornerPoints = line.cornerPoints
+                                        cornerPoints = line.cornerPoints,
+                                        blockBoundingBox = blockBox,
+                                        blockCornerPoints = blockCorners
                                     )
                                 )
                             }
