@@ -6,11 +6,13 @@ import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
 import android.animation.PropertyValuesHolder
 import android.animation.ValueAnimator
+import android.content.ContentValues
 import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.RectF
+import android.provider.MediaStore
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -164,6 +166,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        updateFreezeFrameActionButtons()
         renderProcessingIndicator(force = true)
 
         initServices()
@@ -184,20 +187,19 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun initializeOpenCV(): Boolean {
-        try {
-            // Try to load OpenCV
-            if (!org.opencv.android.OpenCVLoader.initDebug()) {
+        return try {
+            if (!OpenCVInitializer.init()) {
                 Log.e("OpenCV", "OpenCV initialization failed!")
                 Toast.makeText(this, "OpenCV failed to load", Toast.LENGTH_SHORT).show()
-                return false
+                false
             } else {
                 Log.d("OpenCV", "OpenCV initialized successfully")
-                return true
+                true
             }
         } catch (e: UnsatisfiedLinkError) {
             Log.e("OpenCV", "OpenCV library not found", e)
             Toast.makeText(this, "OpenCV library missing", Toast.LENGTH_LONG).show()
-            return false
+            false
         }
     }
 
@@ -360,13 +362,19 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             FrameOcrRepository.currentFrame
                 .filterNotNull()
                 .conflate()
-                .collectLatest { mat ->
+                .collectLatest {
+                    val mat = FrameOcrRepository.snapshotCurrentFrame() ?: return@collectLatest
 
-                    if (mat.empty()) return@collectLatest
-                    if (freezeFrameMode) return@collectLatest
+                    if (mat.empty()) {
+                        mat.release()
+                        return@collectLatest
+                    }
+                    if (freezeFrameMode) {
+                        mat.release()
+                        return@collectLatest
+                    }
 
-                    // Clone immediately (Mat may change later)
-                    val safeMat = mat.clone()
+                    val safeMat = mat
 
                     val w = safeMat.cols()
                     val h = safeMat.rows()
@@ -424,7 +432,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                     kotlinx.coroutines.delay(trackIntervalMs)
                     continue
                 }
-                val frame = FrameOcrRepository.latestCameraFrame.value?.clone()
+                val frame = FrameOcrRepository.snapshotLatestCameraFrame()
                 if (frame != null && !frame.empty()) {
                     trackAndRender(frame)
                 } else {
@@ -498,11 +506,30 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             } else {
                 null
             }
+            val shiftedTextRegions = result.textRegions.mapNotNull { region ->
+                val shiftedRegionBox = region.boundingBox?.let { regionBox ->
+                    shiftRect(regionBox, transform, frame.cols(), frame.rows())
+                }
+                val shiftedRegionCorners = if (shiftedRegionBox != null) {
+                    shiftPoints(region.cornerPoints, transform, frame.cols(), frame.rows())
+                } else {
+                    null
+                }
+                if (shiftedRegionBox == null && shiftedRegionCorners == null) {
+                    null
+                } else {
+                    region.copy(
+                        boundingBox = shiftedRegionBox,
+                        cornerPoints = shiftedRegionCorners
+                    )
+                }
+            }
             result.copy(
                 boundingBox = shiftedBox,
                 cornerPoints = shiftedCorners,
                 blockBoundingBox = shiftedBlockBox,
-                blockCornerPoints = shiftedBlockCorners
+                blockCornerPoints = shiftedBlockCorners,
+                textRegions = shiftedTextRegions
             )
         }
 
@@ -522,6 +549,10 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         try {
             val updated = replacer.replaceText(frame, shifted, snapshot.translations)
             try {
+                if (updated.empty() || updated.cols() <= 0 || updated.rows() <= 0) {
+                    hideOverlayOnly()
+                    return
+                }
                 FrameOcrRepository.updateFrame(updated)
             } finally {
                 updated.release()
@@ -756,13 +787,15 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 return
             }
         }
-        val baseFrame = FrameOcrRepository.latestCameraFrame.value ?: return
+        val baseFrame = FrameOcrRepository.snapshotLatestCameraFrame() ?: return
         if (baseFrame.empty() || baseFrame.cols() <= 0 || baseFrame.rows() <= 0) {
+            baseFrame.release()
             return
         }
 
         val translatedTexts = MutableList(results.size) { "" }
         val anchorGray = toGray(baseFrame)
+        baseFrame.release()
 
         synchronized(trackingLock) {
             trackedResults = results.map { it.copy() }.toMutableList()
@@ -1177,11 +1210,15 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     private fun setupClickListeners() {
         binding.imageCaptureButton.setOnClickListener {
-            if (freezeFrameMode) {
-                exitFreezeFrameMode()
-            } else {
+            if (!freezeFrameMode) {
                 enterFreezeFrameMode()
             }
+        }
+        binding.savePhotoButton.setOnClickListener {
+            saveFrozenFrameToGallery()
+        }
+        binding.returnToCameraButton.setOnClickListener {
+            exitFreezeFrameMode()
         }
     }
 
@@ -1290,6 +1327,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 resetProcessingWork(keepDetecting = false)
                 frozenFrameBitmap?.recycle()
                 frozenFrameBitmap = frozenBitmap
+                updateFreezeFrameActionButtons()
 
                 binding.processedOverlay.scaleType = ImageView.ScaleType.MATRIX
                 binding.processedOverlay.setImageBitmap(frozenBitmap)
@@ -1307,9 +1345,93 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         resetDetectionSession()
         frozenFrameBitmap?.recycle()
         frozenFrameBitmap = null
+        updateFreezeFrameActionButtons()
         resetFreezeState()
         binding.processedOverlay.scaleType = ImageView.ScaleType.FIT_CENTER
         startCameraWithOcr()
+    }
+
+    private fun updateFreezeFrameActionButtons() {
+        val freezeVisible = if (freezeFrameMode) View.VISIBLE else View.GONE
+        val captureVisible = if (freezeFrameMode) View.GONE else View.VISIBLE
+
+        binding.imageCaptureButton.visibility = captureVisible
+        binding.imageCaptureButton.isEnabled = !freezeFrameMode
+        binding.savePhotoButton.visibility = freezeVisible
+        binding.savePhotoButton.isEnabled = freezeFrameMode
+        binding.returnToCameraButton.visibility = freezeVisible
+        binding.returnToCameraButton.isEnabled = freezeFrameMode
+
+        if (freezeFrameMode) {
+            binding.savePhotoButton.bringToFront()
+            binding.returnToCameraButton.bringToFront()
+            binding.controlPanel.invalidate()
+        }
+    }
+
+    private fun saveFrozenFrameToGallery() {
+        val sourceBitmap = frozenFrameBitmap ?: run {
+            showToast(getString(R.string.photo_unavailable))
+            return
+        }
+        val bitmapToSave = Bitmap.createBitmap(sourceBitmap)
+        binding.savePhotoButton.isEnabled = false
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val resolver = applicationContext.contentResolver
+            val displayName = "TextLens_${System.currentTimeMillis()}.jpg"
+            var savedUri = resolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/TextLens")
+                        put(MediaStore.Images.Media.IS_PENDING, 1)
+                    }
+                }
+            )
+
+            val saveSucceeded = try {
+                val targetUri = savedUri ?: error("Unable to create gallery entry")
+                val outputStream = resolver.openOutputStream(targetUri)
+                    ?: error("Unable to open output stream")
+                outputStream.use { stream ->
+                    if (!bitmapToSave.compress(Bitmap.CompressFormat.JPEG, 95, stream)) {
+                        error("Bitmap compression failed")
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    resolver.update(
+                        targetUri,
+                        ContentValues().apply {
+                            put(MediaStore.Images.Media.IS_PENDING, 0)
+                        },
+                        null,
+                        null
+                    )
+                }
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to save frozen frame", e)
+                savedUri?.let { resolver.delete(it, null, null) }
+                savedUri = null
+                false
+            } finally {
+                bitmapToSave.recycle()
+            }
+
+            withContext(Dispatchers.Main) {
+                binding.savePhotoButton.isEnabled = freezeFrameMode
+                showToast(
+                    if (saveSucceeded) {
+                        getString(R.string.photo_saved)
+                    } else {
+                        getString(R.string.photo_save_failed)
+                    }
+                )
+            }
+        }
     }
 
     private fun resetFreezeImageMatrix() {
@@ -1391,14 +1513,12 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun snapshotCurrentFrame(): Mat? {
-        val processed = FrameOcrRepository.currentFrame.value
-        if (processed != null && !processed.empty()) {
-            return processed.clone()
+        FrameOcrRepository.snapshotCurrentFrame()?.let { processed ->
+            return processed
         }
 
-        val raw = FrameOcrRepository.latestCameraFrame.value
-        if (raw != null && !raw.empty()) {
-            return raw.clone()
+        FrameOcrRepository.snapshotLatestCameraFrame()?.let { raw ->
+            return raw
         }
 
         return null

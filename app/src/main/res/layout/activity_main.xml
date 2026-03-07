@@ -12,11 +12,15 @@
         android:id="@+id/cameraContainer"
         android:layout_width="0dp"
         android:layout_height="0dp"
+        android:layout_marginTop="20dp"
+        android:layout_marginBottom="12dp"
         android:background="@android:color/white"
+        app:layout_constraintDimensionRatio="3:4"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toTopOf="@+id/controlPanel"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintVertical_bias="0.6">
 
         <!-- Camera Preview -->
         <androidx.camera.view.PreviewView
@@ -47,6 +51,36 @@
             app:strokeColor="#14111A2B"
             app:strokeWidth="1dp">
 
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal"
+                android:paddingStart="12dp"
+                android:paddingTop="8dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="8dp">
+
+                <ProgressBar
+                    android:id="@+id/processingIndicatorProgress"
+                    style="?android:attr/progressBarStyleSmall"
+                    android:layout_width="14dp"
+                    android:layout_height="14dp"
+                    android:layout_marginEnd="8dp"
+                    android:indeterminate="true"
+                    android:indeterminateTint="@color/status_spinner_idle" />
+
+                <TextView
+                    android:id="@+id/processingIndicatorText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/status_ready"
+                    android:textColor="@color/status_idle_text"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    tools:text="Detecting Text" />
+            </LinearLayout>
+
         </com.google.android.material.card.MaterialCardView>
 
     </FrameLayout>
@@ -54,7 +88,7 @@
     <androidx.constraintlayout.widget.ConstraintLayout
         android:id="@+id/controlPanel"
         android:layout_width="0dp"
-        android:layout_height="300dp"
+        android:layout_height="150dp"
         android:background="#F7F8FA"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
@@ -65,13 +99,13 @@
             android:id="@+id/sourceLanguage"
             android:layout_width="138dp"
             android:layout_height="50dp"
-            android:layout_marginTop="88dp"
+            android:layout_marginTop="4dp"
             android:background="@drawable/spinner_bg"
             android:dropDownWidth="260dp"
             android:dropDownVerticalOffset="8dp"
             android:popupBackground="@drawable/spinner_popup_bg"
             app:layout_constraintEnd_toStartOf="@id/controlCenterline"
-            app:layout_constraintHorizontal_bias="0.485"
+            app:layout_constraintHorizontal_bias="0.47"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toTopOf="parent" />
 
@@ -79,13 +113,13 @@
             android:id="@+id/targetLanguage"
             android:layout_width="138dp"
             android:layout_height="50dp"
-            android:layout_marginTop="88dp"
+            android:layout_marginTop="4dp"
             android:background="@drawable/spinner_bg"
             android:dropDownWidth="260dp"
             android:dropDownVerticalOffset="8dp"
             android:popupBackground="@drawable/spinner_popup_bg"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintHorizontal_bias="0.522"
+            app:layout_constraintHorizontal_bias="0.507"
             app:layout_constraintStart_toEndOf="@id/controlCenterline"
             app:layout_constraintTop_toTopOf="parent" />
 
@@ -93,14 +127,48 @@
             android:id="@+id/image_capture_button"
             android:layout_width="70dp"
             android:layout_height="70dp"
-            android:layout_marginBottom="44dp"
+            android:layout_marginBottom="16dp"
             android:background="@drawable/white_rounded_button"
             android:elevation="2dp"
             app:backgroundTint="@null"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintHorizontal_bias="0.501"
+            app:layout_constraintHorizontal_bias="0.498"
             app:layout_constraintStart_toStartOf="parent" />
+
+        <ImageButton
+            android:id="@+id/savePhotoButton"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="32dp"
+            android:layout_marginBottom="28dp"
+            android:background="@drawable/download_button_bg"
+            android:contentDescription="@string/save_photo"
+            android:elevation="6dp"
+            android:padding="14dp"
+            android:src="@drawable/ic_download_20"
+            android:visibility="gone"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:tint="#0F172A"
+            tools:visibility="visible" />
+
+        <ImageButton
+            android:id="@+id/returnToCameraButton"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginEnd="32dp"
+            android:layout_marginBottom="28dp"
+            android:background="@drawable/download_button_bg"
+            android:contentDescription="@string/return_to_camera"
+            android:elevation="6dp"
+            android:padding="14dp"
+            android:src="@drawable/ic_return_20"
+            android:visibility="gone"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:tint="#0F172A"
+            tools:visibility="visible" />
 
         <androidx.constraintlayout.widget.Guideline
             android:id="@+id/controlCenterline"
@@ -108,42 +176,6 @@
             android:layout_height="wrap_content"
             android:orientation="vertical"
             app:layout_constraintGuide_percent="0.5" />
-
-        <LinearLayout
-            android:id="@+id/statusRow"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="32dp"
-            android:gravity="center_vertical"
-            android:orientation="horizontal"
-            android:paddingStart="12dp"
-            android:paddingTop="8dp"
-            android:paddingEnd="14dp"
-
-            android:paddingBottom="8dp"
-            app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent">
-
-            <ProgressBar
-                android:id="@+id/processingIndicatorProgress"
-                style="?android:attr/progressBarStyleSmall"
-                android:layout_width="14dp"
-                android:layout_height="14dp"
-                android:layout_marginEnd="8dp"
-                android:indeterminate="true"
-                android:indeterminateTint="@color/status_spinner_idle" />
-
-            <TextView
-                android:id="@+id/processingIndicatorText"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/status_ready"
-                android:textColor="@color/status_idle_text"
-                android:textSize="13sp"
-                android:textStyle="bold"
-                tools:text="Detecting Text" />
-        </LinearLayout>
 
     </androidx.constraintlayout.widget.ConstraintLayout>
 

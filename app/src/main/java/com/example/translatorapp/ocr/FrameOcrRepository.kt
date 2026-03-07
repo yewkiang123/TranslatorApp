@@ -9,6 +9,7 @@ import org.opencv.core.Mat
  * Singleton to hold the current camera frame and latest OCR results.
  */
 object FrameOcrRepository {
+    private val frameLock = Any()
 
     // Holds the latest processed frame (with overlays)
     private val _currentFrame = MutableStateFlow<Mat?>(null)
@@ -26,16 +27,36 @@ object FrameOcrRepository {
      * Update the current frame
      */
     fun updateFrame(frame: Mat) {
-        _currentFrame.value?.release() // release previous frame to avoid memory leaks
-        _currentFrame.value = frame.clone() // clone to avoid shared reference issues
+        synchronized(frameLock) {
+            _currentFrame.value?.release()
+            _currentFrame.value = frame.clone()
+        }
     }
 
     /**
      * Update the latest raw camera frame
      */
     fun updateLatestCameraFrame(frame: Mat) {
-        _latestCameraFrame.value?.release()
-        _latestCameraFrame.value = frame.clone()
+        synchronized(frameLock) {
+            _latestCameraFrame.value?.release()
+            _latestCameraFrame.value = frame.clone()
+        }
+    }
+
+    fun snapshotCurrentFrame(): Mat? {
+        synchronized(frameLock) {
+            val frame = _currentFrame.value ?: return null
+            if (frame.empty()) return null
+            return frame.clone()
+        }
+    }
+
+    fun snapshotLatestCameraFrame(): Mat? {
+        synchronized(frameLock) {
+            val frame = _latestCameraFrame.value ?: return null
+            if (frame.empty()) return null
+            return frame.clone()
+        }
     }
 
     /**
@@ -50,7 +71,9 @@ object FrameOcrRepository {
      * Clear the stored data (optional)
      */
     fun clearFrame() {
-        _currentFrame.value?.release()
-        _currentFrame.value = null
+        synchronized(frameLock) {
+            _currentFrame.value?.release()
+            _currentFrame.value = null
+        }
     }
 }

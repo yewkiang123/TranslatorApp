@@ -7,6 +7,7 @@ import androidx.annotation.OptIn
 import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import com.example.translatorapp.OpenCVInitializer
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
@@ -27,6 +28,11 @@ import kotlin.coroutines.resumeWithException
 
 class OcrService : ImageAnalysis.Analyzer {
 
+    data class TextRegion(
+        val boundingBox: Rect?,
+        val cornerPoints: Array<android.graphics.Point>? = null
+    )
+
     data class DetectionResult(
         val language: String,
         val text: String,
@@ -34,6 +40,7 @@ class OcrService : ImageAnalysis.Analyzer {
         val cornerPoints: Array<android.graphics.Point>? = null,
         val blockBoundingBox: Rect? = null,
         val blockCornerPoints: Array<android.graphics.Point>? = null,
+        val textRegions: List<TextRegion> = emptyList(),
         val roiMat: Mat? = null
     )
 
@@ -72,7 +79,20 @@ class OcrService : ImageAnalysis.Analyzer {
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
-        var fullMat = imageProxy.toMat() ?: run {
+        if (!OpenCVInitializer.isReady()) {
+            imageProxy.close()
+            return
+        }
+
+        var fullMat = try {
+            imageProxy.toMat()
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e("OCR", "OpenCV native symbols unavailable while converting camera frame", e)
+            null
+        } catch (e: Exception) {
+            Log.e("OCR", "Failed to convert camera frame to Mat", e)
+            null
+        } ?: run {
             imageProxy.close()
             return
         }
@@ -137,6 +157,18 @@ class OcrService : ImageAnalysis.Analyzer {
 
                                 seenBoxes.add(box)
                                 recognizerFoundCount++
+                                val textRegions = line.elements.mapNotNull { element ->
+                                    val elementBox = element.boundingBox
+                                    val elementCorners = element.cornerPoints
+                                    if (elementBox == null && elementCorners == null) {
+                                        null
+                                    } else {
+                                        TextRegion(
+                                            boundingBox = elementBox,
+                                            cornerPoints = elementCorners
+                                        )
+                                    }
+                                }
 
                                 results.add(
                                     DetectionResult(
@@ -145,7 +177,8 @@ class OcrService : ImageAnalysis.Analyzer {
                                         boundingBox = box,
                                         cornerPoints = line.cornerPoints,
                                         blockBoundingBox = blockBox,
-                                        blockCornerPoints = blockCorners
+                                        blockCornerPoints = blockCorners,
+                                        textRegions = textRegions
                                     )
                                 )
                             }
@@ -365,14 +398,29 @@ fun ImageProxy.toMat(): Mat? {
     if (this.format != android.graphics.ImageFormat.YUV_420_888) return null
 
     val nv21 = yuv420ToNv21(this)
-    val yuv = Mat(this.height + this.height / 2, this.width, CvType.CV_8UC1)
-    yuv.put(0, 0, nv21)
-
+    val yuv = Mat()
     val rgba = Mat()
-    Imgproc.cvtColor(yuv, rgba, Imgproc.COLOR_YUV2RGBA_NV21, 4)
-    yuv.release()
 
-    return rgba
+    return try {
+        yuv.create(this.height + this.height / 2, this.width, CvType.CV_8UC1)
+        yuv.put(0, 0, nv21)
+        Imgproc.cvtColor(yuv, rgba, Imgproc.COLOR_YUV2RGBA_NV21, 4)
+        if (rgba.empty()) {
+            rgba.release()
+            null
+        } else {
+            rgba
+        }
+    } catch (e: UnsatisfiedLinkError) {
+        rgba.release()
+        throw e
+    } catch (e: Exception) {
+        Log.e("OCR", "toMat failed", e)
+        rgba.release()
+        null
+    } finally {
+        yuv.release()
+    }
 }
 
 private fun yuv420ToNv21(image: ImageProxy): ByteArray {
