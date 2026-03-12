@@ -134,12 +134,30 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         val scaleHint: Double?
     )
 
+    private data class TemplateTrackingSummary(
+        val results: List<OcrService.DetectionResult>,
+        val matchedIndices: Set<Int>
+    ) {
+        val matchedCount: Int
+            get() = matchedIndices.size
+    }
+
+    private data class TemplateMatch(
+        val dx: Double,
+        val dy: Double
+    )
+
     private data class MetricsSession(
         val frameCapturedAtMs: Long,
         val ocrCompletedAtMs: Long,
         var pendingTranslationBatches: Int = 0,
         var translationCompletedAtMs: Long? = null,
         var overlayShownAtMs: Long? = null
+    )
+
+    private data class TrackedOverlayEntry(
+        val result: OcrService.DetectionResult,
+        val translation: String
     )
 
     private class FpsTracker {
@@ -182,6 +200,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private val downloadingLanguageCodes = mutableSetOf<String>()
     private val languageCodeByDisplay = HashMap<String, String>()
     private val translationCache = HashMap<String, String>()
+    private val normalizedTranslationCache = HashMap<String, String>()
     private lateinit var sourceSpinnerAdapter: SourceLanguageAdapter
     private lateinit var targetSpinnerAdapter: TargetLanguageAdapter
 
@@ -203,6 +222,16 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private val minTrackShiftPx = 1.5
     private val maxTrackStepPx = 60.0
     private val minScaleDelta = 0.015
+    private val trackingJitterTranslationPx = 2.25
+    private val trackingJitterScaleDelta = 0.02
+    private val trackingJitterRotationDegrees = 1.25
+    private val minTrackingTemplateContextPx = 4
+    private val maxTrackingTemplateContextPx = 10
+    private val minTrackingSearchPaddingPx = 18
+    private val maxTrackingSearchPaddingPx = 72
+    private val minTrackingTemplateMatchScore = 0.62
+    private val minOverlayGeometryReuseIoU = 0.82
+    private val maxOverlayGeometryReuseCenterShiftPx = 6.0
     private val minTrackScale = 0.82
     private val maxTrackScale = 1.22
     private val zoomResetThreshold = 0.22
@@ -322,14 +351,18 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }.launchIn(lifecycleScope)
 
         ocrService.detectionEvents.onEach { event ->
-            if (!freezeFrameMode) {
-                recordOcrEvent(event)
-            }
-            if (event.results.isNotEmpty()) {
-                setNoTextDetected(false)
-                processOnInterval(event)
-            } else if (!freezeFrameMode) {
-                showNoTextDetected()
+            try {
+                if (!freezeFrameMode) {
+                    recordOcrEvent(event)
+                }
+                if (event.results.isNotEmpty()) {
+                    setNoTextDetected(false)
+                    processOnInterval(event)
+                } else if (!freezeFrameMode && !hasActiveTracking()) {
+                    showNoTextDetected()
+                }
+            } finally {
+                FrameOcrRepository.discardOcrSourceFrame(event.requestId)
             }
         }.launchIn(lifecycleScope)
 
@@ -372,6 +405,26 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             detectingActive = false
         }
         renderProcessingIndicator(force = true)
+    }
+
+    private fun hasActiveTracking(): Boolean {
+        synchronized(trackingLock) {
+            return trackedResults.isNotEmpty()
+        }
+    }
+
+    private fun snapshotTrackedOverlayEntries(): List<TrackedOverlayEntry> {
+        synchronized(trackingLock) {
+            return trackedResults.mapIndexedNotNull { index, result ->
+                val translation = trackedTranslations.getOrNull(index)?.trim().orEmpty()
+                val box = result.blockBoundingBox ?: result.boundingBox
+                if (translation.isEmpty() || box == null) {
+                    null
+                } else {
+                    TrackedOverlayEntry(result = result.copy(), translation = translation)
+                }
+            }
+        }
     }
 
     private fun resetRuntimeMetrics() {
@@ -799,70 +852,56 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             return
         }
 
-        val referencePivot = computeTrackingPivot(
-            snapshot.referenceResults,
-            frame.cols(),
-            frame.rows()
-        )
         val currentGray = toGray(frame)
-        val estimatedTransform = estimateTrackingTransform(
+        val trackingSummary = trackResultsByTemplate(
             prev = snapshot.anchorGray,
             current = currentGray,
             referenceResults = snapshot.referenceResults,
-            referencePivot = referencePivot
-        )
-        snapshot.anchorGray.release()
-
-        val (stepTransform, accumulatedTransform, missCount) = synchronized(trackingLock) {
-            if (estimatedTransform != null) {
-                trackingAccumulatedTransform = composeTransforms(
-                    step = estimatedTransform,
-                    accumulated = trackingAccumulatedTransform
-                )
-                trackingMissCount = 0
-                Triple(estimatedTransform, trackingAccumulatedTransform, trackingMissCount)
-            } else {
-                trackingMissCount++
-                Triple(TrackingTransform(), trackingAccumulatedTransform, trackingMissCount)
-            }
-        }
-
-        if (estimatedTransform == null && missCount > maxTrackingMisses) {
-            currentGray.release()
-            clearTrackingState()
-            frame.release()
-            return
-        }
-
-        if (measureTransformMotion(stepTransform, referencePivot) > panThresholdPx ||
-            abs(stepTransform.scale - 1.0) > zoomResetThreshold) {
-            currentGray.release()
-            clearTrackingState()
-            frame.release()
-            return
-        }
-
-        val shifted = applyTrackingTransform(
-            results = snapshot.baseResults,
-            transform = accumulatedTransform,
             maxW = frame.cols(),
             maxH = frame.rows()
         )
+        snapshot.anchorGray.release()
+
+        val trackedEntries = if (trackingSummary == null || trackingSummary.matchedCount == 0) {
+            emptyList()
+        } else {
+            snapshot.referenceResults.mapIndexedNotNull { index, _ ->
+                if (index !in trackingSummary.matchedIndices) {
+                    return@mapIndexedNotNull null
+                }
+                val shiftedResult = trackingSummary.results.getOrNull(index) ?: return@mapIndexedNotNull null
+                TrackedOverlayEntry(
+                    result = shiftedResult,
+                    translation = snapshot.translations.getOrNull(index).orEmpty()
+                )
+            }
+        }
+        if (trackedEntries.isEmpty()) {
+            currentGray.release()
+            clearTrackingState()
+            ocrService.requestImmediateRefresh()
+            frame.release()
+            return
+        }
+
+        if (trackedEntries.size != snapshot.referenceResults.size) {
+            ocrService.requestImmediateRefresh()
+        }
+
+        val shifted = trackedEntries.map { it.result }
+        val shiftedTranslations = trackedEntries.map { it.translation }
 
         if (shifted.none { it.boundingBox != null }) {
             currentGray.release()
             clearTrackingState()
+            ocrService.requestImmediateRefresh()
             frame.release()
             return
         }
 
-        if (estimatedTransform != null) {
-            advanceTrackingState(shifted, currentGray)
-        } else {
-            currentGray.release()
-        }
+        advanceTrackingState(shifted, shiftedTranslations, currentGray)
 
-        if (snapshot.translations.none { it.isNotBlank() }) {
+        if (shiftedTranslations.none { it.isNotBlank() }) {
             hideOverlayOnly()
             frame.release()
             return
@@ -870,7 +909,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
         setGeneratingActive(true)
         try {
-            val updated = replacer.replaceText(frame, shifted, snapshot.translations)
+            val updated = replacer.replaceText(frame, shifted, shiftedTranslations)
             try {
                 if (updated.empty() || updated.cols() <= 0 || updated.rows() <= 0) {
                     hideOverlayOnly()
@@ -916,6 +955,152 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             else -> Imgproc.cvtColor(src, gray, Imgproc.COLOR_BGR2GRAY)
         }
         return gray
+    }
+
+    private fun trackResultsByTemplate(
+        prev: Mat,
+        current: Mat,
+        referenceResults: List<OcrService.DetectionResult>,
+        maxW: Int,
+        maxH: Int
+    ): TemplateTrackingSummary? {
+        if (prev.empty() || current.empty() || referenceResults.isEmpty()) return null
+
+        val matches = arrayOfNulls<TemplateMatch>(referenceResults.size)
+        val matchedIndices = LinkedHashSet<Int>()
+
+        referenceResults.forEachIndexed { index, result ->
+            val match = matchResultTemplate(prev, current, result)
+            if (match != null) {
+                matches[index] = match
+                matchedIndices.add(index)
+            }
+        }
+
+        if (matchedIndices.isEmpty()) {
+            return TemplateTrackingSummary(
+                results = referenceResults.map { it.copy() },
+                matchedIndices = emptySet()
+            )
+        }
+
+        val shiftedResults = referenceResults.mapIndexed { index, result ->
+            val match = matches[index]
+            if (match == null) {
+                result.copy()
+            } else {
+                applyTrackingTransform(
+                    results = listOf(result),
+                    transform = TrackingTransform(m02 = match.dx, m12 = match.dy),
+                    maxW = maxW,
+                    maxH = maxH
+                ).first()
+            }
+        }
+
+        return TemplateTrackingSummary(
+            results = shiftedResults,
+            matchedIndices = matchedIndices
+        )
+    }
+
+    private fun matchResultTemplate(
+        prev: Mat,
+        current: Mat,
+        result: OcrService.DetectionResult
+    ): TemplateMatch? {
+        val referenceBox = result.blockBoundingBox ?: result.boundingBox ?: return null
+        if (referenceBox.width() <= 0 || referenceBox.height() <= 0) return null
+
+        val templatePadding = computeTemplateContextPadding(referenceBox)
+        val searchPadding = computeTemplateSearchPadding(referenceBox)
+        val templateRect = expandTrackingRect(
+            rect = referenceBox,
+            padding = templatePadding,
+            maxWidth = prev.cols(),
+            maxHeight = prev.rows()
+        ) ?: return null
+        val searchRect = expandTrackingRect(
+            rect = templateRect,
+            padding = searchPadding,
+            maxWidth = current.cols(),
+            maxHeight = current.rows()
+        ) ?: return null
+
+        if (searchRect.width() < templateRect.width() || searchRect.height() < templateRect.height()) {
+            return null
+        }
+
+        val template = Mat(
+            prev,
+            org.opencv.core.Rect(
+                templateRect.left,
+                templateRect.top,
+                templateRect.width(),
+                templateRect.height()
+            )
+        )
+        val search = Mat(
+            current,
+            org.opencv.core.Rect(
+                searchRect.left,
+                searchRect.top,
+                searchRect.width(),
+                searchRect.height()
+            )
+        )
+        val response = Mat()
+
+        return try {
+            if (template.empty() || search.empty()) return null
+
+            Imgproc.matchTemplate(search, template, response, Imgproc.TM_CCOEFF_NORMED)
+            if (response.empty()) return null
+
+            val bestMatch = Core.minMaxLoc(response)
+            val score = bestMatch.maxVal
+            if (!score.isFinite() || score < minTrackingTemplateMatchScore) {
+                return null
+            }
+
+            TemplateMatch(
+                dx = searchRect.left + bestMatch.maxLoc.x - templateRect.left,
+                dy = searchRect.top + bestMatch.maxLoc.y - templateRect.top
+            )
+        } finally {
+            response.release()
+            search.release()
+            template.release()
+        }
+    }
+
+    private fun computeTemplateContextPadding(rect: android.graphics.Rect): Int {
+        val baseSize = minOf(rect.width(), rect.height()).toDouble()
+        return (baseSize * 0.2).roundToInt()
+            .coerceIn(minTrackingTemplateContextPx, maxTrackingTemplateContextPx)
+    }
+
+    private fun computeTemplateSearchPadding(rect: android.graphics.Rect): Int {
+        val baseSize = maxOf(rect.width(), rect.height()).toDouble()
+        return (baseSize * 0.8).roundToInt()
+            .coerceIn(minTrackingSearchPaddingPx, maxTrackingSearchPaddingPx)
+    }
+
+    private fun expandTrackingRect(
+        rect: android.graphics.Rect,
+        padding: Int,
+        maxWidth: Int,
+        maxHeight: Int
+    ): android.graphics.Rect? {
+        if (maxWidth <= 0 || maxHeight <= 0) return null
+
+        val left = (rect.left - padding).coerceIn(0, maxWidth - 1)
+        val top = (rect.top - padding).coerceIn(0, maxHeight - 1)
+        val right = (rect.right + padding).coerceIn(left + 1, maxWidth)
+        val bottom = (rect.bottom + padding).coerceIn(top + 1, maxHeight)
+        if (right <= left || bottom <= top) return null
+
+        return android.graphics.Rect(left, top, right, bottom)
     }
 
     private fun estimateTrackingTransform(
@@ -1376,6 +1561,22 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         return rotation.coerceIn(-maxRotation, maxRotation)
     }
 
+    private fun filterTrackingJitter(
+        transform: TrackingTransform,
+        referencePivot: Point
+    ): TrackingTransform {
+        val translationMagnitude = measureTransformMotion(transform, referencePivot)
+        val scaleDelta = abs(transform.scale - 1.0)
+        val rotationDegrees = abs(Math.toDegrees(atan2(transform.m10, transform.m00)))
+        if (translationMagnitude < trackingJitterTranslationPx &&
+            scaleDelta < trackingJitterScaleDelta &&
+            rotationDegrees < trackingJitterRotationDegrees
+        ) {
+            return TrackingTransform()
+        }
+        return transform
+    }
+
     private fun computeTrackingMotionStats(
         prevPoints: List<Point>,
         nextPoints: List<Point>
@@ -1573,16 +1774,21 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     private fun advanceTrackingState(
         shiftedResults: List<OcrService.DetectionResult>,
+        shiftedTranslations: List<String>,
         nextAnchorGray: Mat
     ) {
         synchronized(trackingLock) {
             trackedResults = shiftedResults.map { it.copy() }.toMutableList()
+            trackedBaseResults = shiftedResults.map { it.copy() }.toMutableList()
+            trackedTranslations = shiftedTranslations.toMutableList()
             trackingAnchorGray?.release()
             trackingAnchorGray = nextAnchorGray
+            trackingAccumulatedTransform = TrackingTransform()
+            trackingMissCount = 0
         }
     }
 
-    private fun clearTrackingState() {
+    private fun clearTrackingState(clearTranslationCache: Boolean = false) {
         synchronized(trackingLock) {
             trackedResults.clear()
             trackedBaseResults.clear()
@@ -1592,7 +1798,11 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             trackingAccumulatedTransform = TrackingTransform()
             trackingMissCount = 0
         }
-        translationCache.clear()
+        if (clearTranslationCache) {
+            translationCache.clear()
+            normalizedTranslationCache.clear()
+        }
+        replacer.clearCaches()
         FrameOcrRepository.clearFrame()
         FrameOcrRepository.clearOcrSourceFrame()
         overlayEnabled = false
@@ -1611,7 +1821,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun resetDetectionSession() {
-        clearTrackingState()
+        clearTrackingState(clearTranslationCache = true)
         ocrService.resetSessionState()
         lastProcessTime = 0L
         resetProcessingWork(keepDetecting = !freezeFrameMode && isOpenCvReady)
@@ -1619,24 +1829,25 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private fun processOnInterval(event: OcrService.OcrDetectionEvent) {
         if (freezeFrameMode) return
 
-        val results = event.results
+        val incomingResults = event.results
         val now = System.currentTimeMillis()
         if (now - lastProcessTime <= processInterval) return
         lastProcessTime = now
-        synchronized(trackingLock) {
-            if (trackedResults.isNotEmpty()) {
-                return
-            }
-        }
-        val baseFrame = FrameOcrRepository.snapshotOcrSourceFrame()
-            ?: FrameOcrRepository.snapshotLatestCameraFrame()
-            ?: return
+        val baseFrame = FrameOcrRepository.snapshotOcrSourceFrame(event.requestId) ?: return
         if (baseFrame.empty() || baseFrame.cols() <= 0 || baseFrame.rows() <= 0) {
             baseFrame.release()
             return
         }
 
-        val translatedTexts = MutableList(results.size) { "" }
+        val previousEntries = snapshotTrackedOverlayEntries()
+        val mergedEntries = mergeTrackedOverlayEntries(
+            freshResults = incomingResults,
+            previousEntries = previousEntries,
+            maxWidth = baseFrame.cols(),
+            maxHeight = baseFrame.rows()
+        )
+        val results = mergedEntries.map { it.result }
+        val translatedTexts = mergedEntries.mapTo(mutableListOf()) { it.translation }
         val anchorGray = toGray(baseFrame)
         baseFrame.release()
         val metricsSession = startMetricsSession(event)
@@ -1658,13 +1869,14 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         results.forEachIndexed { index, result ->
             val text = result.text
 
-            translationCache[text]?.let { cached ->
+            findCachedTranslation(text)?.let { cached ->
                 applyTranslationResult(index, cached, translatedTexts)
                 return@forEachIndexed
             }
 
             val sourceLanguage = LanguageUiLogic.resolveSourceLanguage(selectedSourceCode, result.language)
             if (LanguageUiLogic.shouldBypassTranslation(sourceLanguage, targetLanguage, text)) {
+                cacheTranslation(text, text)
                 applyTranslationResult(index, text, translatedTexts)
                 return@forEachIndexed
             }
@@ -1688,7 +1900,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                             for (i in 0 until count) {
                                 val (index, originalText) = batch[i]
                                 val translated = translatedBatch[i]
-                                translationCache[originalText] = translated
+                                cacheTranslation(originalText, translated)
                                 applyTranslationResult(index, translated, translatedTexts)
                             }
                         } finally {
@@ -1714,6 +1926,224 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
     }
 
+    private fun mergeTrackedOverlayEntries(
+        freshResults: List<OcrService.DetectionResult>,
+        previousEntries: List<TrackedOverlayEntry>,
+        maxWidth: Int,
+        maxHeight: Int
+    ): List<TrackedOverlayEntry> {
+        if (previousEntries.isEmpty()) {
+            return dedupeTrackedOverlayEntries(
+                freshResults.map { result ->
+                    TrackedOverlayEntry(result = result, translation = "")
+                }
+            )
+        }
+
+        val consumedPrevious = BooleanArray(previousEntries.size)
+        val merged = ArrayList<TrackedOverlayEntry>(freshResults.size + previousEntries.size)
+
+        freshResults.forEach { result ->
+            val matchedIndex = findBestTrackedOverlayMatch(result, previousEntries, consumedPrevious)
+            val entry = if (matchedIndex >= 0) {
+                consumedPrevious[matchedIndex] = true
+                stabilizeTrackedOverlayEntry(
+                    freshResult = result,
+                    previousEntry = previousEntries[matchedIndex]
+                )
+            } else {
+                TrackedOverlayEntry(result = result, translation = "")
+            }
+            merged.add(entry)
+        }
+
+        previousEntries.forEachIndexed { index, entry ->
+            if (consumedPrevious[index]) return@forEachIndexed
+            if (!shouldPersistTrackedOverlayEntry(entry, merged, maxWidth, maxHeight)) return@forEachIndexed
+            merged.add(entry)
+        }
+
+        return dedupeTrackedOverlayEntries(merged)
+    }
+
+    private fun findBestTrackedOverlayMatch(
+        freshResult: OcrService.DetectionResult,
+        previousEntries: List<TrackedOverlayEntry>,
+        consumedPrevious: BooleanArray
+    ): Int {
+        val freshBox = freshResult.blockBoundingBox ?: freshResult.boundingBox ?: return -1
+        val freshNormalizedText = normalizedTranslationKey(freshResult.text)
+        var bestIndex = -1
+        var bestScore = 0.0
+
+        previousEntries.forEachIndexed { index, entry ->
+            if (consumedPrevious[index]) return@forEachIndexed
+            val previousBox = entry.result.blockBoundingBox ?: entry.result.boundingBox ?: return@forEachIndexed
+            val overlap = rectIoU(freshBox, previousBox)
+            if (overlap <= 0.0) return@forEachIndexed
+
+            var score = overlap
+            if (normalizedTranslationKey(entry.result.text) == freshNormalizedText) {
+                score += 0.25
+            }
+            if (score > bestScore) {
+                bestScore = score
+                bestIndex = index
+            }
+        }
+
+        if (bestScore >= 0.35) {
+            return bestIndex
+        }
+
+        if (freshNormalizedText.isBlank()) {
+            return -1
+        }
+
+        var bestFallbackIndex = -1
+        var bestFallbackDistance = Double.POSITIVE_INFINITY
+        previousEntries.forEachIndexed { index, entry ->
+            if (consumedPrevious[index]) return@forEachIndexed
+            if (entry.translation.isBlank()) return@forEachIndexed
+            if (normalizedTranslationKey(entry.result.text) != freshNormalizedText) return@forEachIndexed
+            val previousBox = entry.result.blockBoundingBox ?: entry.result.boundingBox ?: return@forEachIndexed
+            val distance = rectCenterDistance(freshBox, previousBox)
+            if (distance < bestFallbackDistance) {
+                bestFallbackDistance = distance
+                bestFallbackIndex = index
+            }
+        }
+
+        return bestFallbackIndex
+    }
+
+    private fun stabilizeTrackedOverlayEntry(
+        freshResult: OcrService.DetectionResult,
+        previousEntry: TrackedOverlayEntry
+    ): TrackedOverlayEntry {
+        if (previousEntry.translation.isBlank()) {
+            return TrackedOverlayEntry(
+                result = freshResult,
+                translation = previousEntry.translation
+            )
+        }
+
+        return if (shouldReuseTrackedOverlayGeometry(freshResult, previousEntry.result)) {
+            previousEntry
+        } else {
+            TrackedOverlayEntry(
+                result = freshResult,
+                translation = previousEntry.translation
+            )
+        }
+    }
+
+    private fun shouldPersistTrackedOverlayEntry(
+        entry: TrackedOverlayEntry,
+        mergedEntries: List<TrackedOverlayEntry>,
+        maxWidth: Int,
+        maxHeight: Int
+    ): Boolean {
+        if (entry.translation.isBlank()) return false
+        val entryBox = entry.result.blockBoundingBox ?: entry.result.boundingBox ?: return false
+        if (!TrackingFrameBounds.containsRect(
+                left = entryBox.left,
+                top = entryBox.top,
+                right = entryBox.right,
+                bottom = entryBox.bottom,
+                maxWidth = maxWidth,
+                maxHeight = maxHeight
+            )
+        ) {
+            return false
+        }
+
+        return mergedEntries.none { merged ->
+            val mergedBox = merged.result.blockBoundingBox ?: merged.result.boundingBox ?: return@none false
+            rectIoU(entryBox, mergedBox) >= 0.25
+        }
+    }
+
+    private fun rectIoU(a: android.graphics.Rect, b: android.graphics.Rect): Double {
+        val left = maxOf(a.left, b.left)
+        val top = maxOf(a.top, b.top)
+        val right = minOf(a.right, b.right)
+        val bottom = minOf(a.bottom, b.bottom)
+        if (right <= left || bottom <= top) return 0.0
+
+        val intersectionArea = (right - left).toDouble() * (bottom - top).toDouble()
+        val unionArea = (a.width().toDouble() * a.height().toDouble()) +
+            (b.width().toDouble() * b.height().toDouble()) -
+            intersectionArea
+        if (unionArea <= 0.0) return 0.0
+        return intersectionArea / unionArea
+    }
+
+    private fun rectCenterDistance(a: android.graphics.Rect, b: android.graphics.Rect): Double {
+        val centerAx = (a.left + a.right) / 2.0
+        val centerAy = (a.top + a.bottom) / 2.0
+        val centerBx = (b.left + b.right) / 2.0
+        val centerBy = (b.top + b.bottom) / 2.0
+        return hypot(centerAx - centerBx, centerAy - centerBy)
+    }
+
+    private fun shouldReuseTrackedOverlayGeometry(
+        freshResult: OcrService.DetectionResult,
+        previousResult: OcrService.DetectionResult
+    ): Boolean {
+        val freshBox = freshResult.blockBoundingBox ?: freshResult.boundingBox ?: return false
+        val previousBox = previousResult.blockBoundingBox ?: previousResult.boundingBox ?: return false
+        val overlap = rectIoU(freshBox, previousBox)
+        if (overlap < minOverlayGeometryReuseIoU) {
+            return false
+        }
+        return rectCenterDistance(freshBox, previousBox) <= maxOverlayGeometryReuseCenterShiftPx
+    }
+
+    private fun dedupeTrackedOverlayEntries(
+        entries: List<TrackedOverlayEntry>
+    ): List<TrackedOverlayEntry> {
+        val deduped = ArrayList<TrackedOverlayEntry>(entries.size)
+        entries.forEach { candidate ->
+            val duplicateIndex = deduped.indexOfFirst { existing ->
+                areTrackedOverlayEntriesDuplicate(existing, candidate)
+            }
+            if (duplicateIndex < 0) {
+                deduped.add(candidate)
+            } else {
+                deduped[duplicateIndex] = choosePreferredTrackedOverlayEntry(
+                    existing = deduped[duplicateIndex],
+                    candidate = candidate
+                )
+            }
+        }
+        return deduped
+    }
+
+    private fun areTrackedOverlayEntriesDuplicate(
+        first: TrackedOverlayEntry,
+        second: TrackedOverlayEntry
+    ): Boolean {
+        if (normalizedTranslationKey(first.result.text) != normalizedTranslationKey(second.result.text)) {
+            return false
+        }
+        val firstBox = first.result.blockBoundingBox ?: first.result.boundingBox ?: return false
+        val secondBox = second.result.blockBoundingBox ?: second.result.boundingBox ?: return false
+        return rectIoU(firstBox, secondBox) >= 0.55
+    }
+
+    private fun choosePreferredTrackedOverlayEntry(
+        existing: TrackedOverlayEntry,
+        candidate: TrackedOverlayEntry
+    ): TrackedOverlayEntry {
+        return when {
+            existing.translation.isBlank() && candidate.translation.isNotBlank() -> candidate
+            existing.translation.isNotBlank() && candidate.translation.isBlank() -> existing
+            candidate.result.textRegions.size > existing.result.textRegions.size -> candidate
+            else -> existing
+        }
+    }
+
     private fun applyTranslationResult(
         index: Int,
         text: String,
@@ -1726,6 +2156,27 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 trackedTranslations[index] = text
             }
         }
+    }
+
+    private fun findCachedTranslation(text: String): String? {
+        return TranslationReusePolicy.findCachedTranslation(
+            text = text,
+            exactCache = translationCache,
+            normalizedCache = normalizedTranslationCache
+        )
+    }
+
+    private fun cacheTranslation(text: String, translation: String) {
+        TranslationReusePolicy.cacheTranslation(
+            text = text,
+            translation = translation,
+            exactCache = translationCache,
+            normalizedCache = normalizedTranslationCache
+        )
+    }
+
+    private fun normalizedTranslationKey(text: String): String {
+        return TranslationReusePolicy.normalizedKey(text)
     }
 
 

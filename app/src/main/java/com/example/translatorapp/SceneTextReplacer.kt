@@ -91,6 +91,10 @@ class SceneTextReplacer(
     }
     private val textBounds = android.graphics.Rect()
     private val stableTextColors = LinkedHashMap<String, Int>()
+    private var cachedInpaintedFrame: Mat? = null
+    private var cachedInpaintSignature: String? = null
+    private var cachedInpaintWidth = 0
+    private var cachedInpaintHeight = 0
 
     fun replaceText(
         frame: Mat,
@@ -115,23 +119,36 @@ class SceneTextReplacer(
             val baseItems = collectDrawItems(detectionResults, translatedTexts)
             if (baseItems.isEmpty()) {
                 stableTextColors.clear()
+                clearInpaintCache()
                 return working
             }
             retainOnlyActiveColorKeys(baseItems.mapTo(HashSet()) { it.stableKey })
 
             val inpaintRegions = collectInpaintRegions(baseItems)
             val inpaintMask = buildInpaintMask(working.cols(), working.rows(), inpaintRegions)
+            val inpaintSignature = buildInpaintSignature(inpaintRegions)
             if (Core.countNonZero(inpaintMask) > 0) {
-                val inpainted = Mat()
-                Photo.inpaint(
-                    working,
-                    inpaintMask,
-                    inpainted,
-                    TELEA_INPAINT_RADIUS,
-                    Photo.INPAINT_TELEA
-                )
-                working.release()
-                working = inpainted
+                val cachedFrame = cachedInpaintedFrame
+                if (canReuseCachedInpaint(working.cols(), working.rows(), inpaintSignature) &&
+                    cachedFrame != null &&
+                    !cachedFrame.empty()
+                ) {
+                    cachedFrame.copyTo(working, inpaintMask)
+                } else {
+                    val inpainted = Mat()
+                    Photo.inpaint(
+                        working,
+                        inpaintMask,
+                        inpainted,
+                        TELEA_INPAINT_RADIUS,
+                        Photo.INPAINT_TELEA
+                    )
+                    working.release()
+                    working = inpainted
+                    updateInpaintCache(inpainted, inpaintSignature)
+                }
+            } else {
+                clearInpaintCache()
             }
             inpaintMask.release()
 
@@ -180,6 +197,11 @@ class SceneTextReplacer(
         return working
     }
 
+    fun clearCaches() {
+        stableTextColors.clear()
+        clearInpaintCache()
+    }
+
     private fun collectDrawItems(
         detectionResults: List<OcrService.DetectionResult>,
         translatedTexts: List<String>
@@ -189,9 +211,11 @@ class SceneTextReplacer(
             val text = translatedTexts.getOrNull(index)?.trim().orEmpty()
             val box = result.boundingBox ?: return@forEachIndexed
             if (text.isEmpty()) return@forEachIndexed
+            val stableRegionBox = result.blockBoundingBox ?: box
+            val stableRegionCorners = result.blockCornerPoints ?: result.cornerPoints
             items.add(
                 DrawItem(
-                    stableKey = "$index:${text.hashCode()}",
+                    stableKey = "${buildRegionKey(stableRegionBox, stableRegionCorners)}:${text.hashCode()}",
                     result = result,
                     box = box,
                     text = text
@@ -219,6 +243,14 @@ class SceneTextReplacer(
         }
 
         return regions
+    }
+
+    private fun buildInpaintSignature(regions: List<InpaintRegion>): String {
+        return regions.map { region ->
+            buildRegionKey(region.box, region.cornerPoints)
+        }
+            .sorted()
+            .joinToString(separator = "|")
     }
 
     private fun buildRegionKey(
@@ -716,6 +748,35 @@ class SceneTextReplacer(
             selected.g.toInt().coerceIn(0, 255),
             selected.b.toInt().coerceIn(0, 255)
         )
+    }
+
+    private fun canReuseCachedInpaint(
+        width: Int,
+        height: Int,
+        signature: String
+    ): Boolean {
+        return cachedInpaintSignature == signature &&
+            cachedInpaintWidth == width &&
+            cachedInpaintHeight == height
+    }
+
+    private fun updateInpaintCache(
+        inpainted: Mat,
+        signature: String
+    ) {
+        clearInpaintCache()
+        cachedInpaintedFrame = inpainted.clone()
+        cachedInpaintSignature = signature
+        cachedInpaintWidth = inpainted.cols()
+        cachedInpaintHeight = inpainted.rows()
+    }
+
+    private fun clearInpaintCache() {
+        cachedInpaintedFrame?.release()
+        cachedInpaintedFrame = null
+        cachedInpaintSignature = null
+        cachedInpaintWidth = 0
+        cachedInpaintHeight = 0
     }
 
     private fun otsuThreshold(histogram: IntArray, totalCount: Int): Int {
