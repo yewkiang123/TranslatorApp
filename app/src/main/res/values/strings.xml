@@ -9,6 +9,7 @@
     <string name="downloading_language_pack">Downloading language pack</string>
     <string name="status_ready">Ready</string>
     <string name="status_detecting_text">Detecting Text</string>
+    <string name="status_no_text_detected">No text detected</string>
     <string name="status_translating">Translating</string>
     <string name="status_generating_image">Generating Image</string>
     <string name="status_ocr_disabled">OCR unavailable</string>

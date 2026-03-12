@@ -83,6 +83,34 @@
 
         </com.google.android.material.card.MaterialCardView>
 
+        <com.google.android.material.card.MaterialCardView
+            android:id="@+id/metricsCard"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="bottom|start"
+            android:layout_marginStart="14dp"
+            android:layout_marginBottom="14dp"
+            app:cardBackgroundColor="#EAF2FF"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp"
+            app:strokeColor="#1E3A8A"
+            app:strokeWidth="1dp">
+
+            <TextView
+                android:id="@+id/metricsText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:paddingStart="12dp"
+                android:paddingTop="10dp"
+                android:paddingEnd="12dp"
+                android:paddingBottom="10dp"
+                android:textColor="#0F172A"
+                android:textSize="11sp"
+                tools:text="Analyzer FPS: 4.8&#10;OCR FPS: 1.1&#10;Overlay FPS: 7.4&#10;First Result: 2140 ms&#10;OCR Latency: 460 ms&#10;Translation: 310 ms&#10;End-to-End: 940 ms" />
+
+        </com.google.android.material.card.MaterialCardView>
+
     </FrameLayout>
 
     <androidx.constraintlayout.widget.ConstraintLayout

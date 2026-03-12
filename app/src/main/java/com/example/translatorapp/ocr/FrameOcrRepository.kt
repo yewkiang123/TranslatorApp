@@ -19,6 +19,10 @@ object FrameOcrRepository {
     private val _latestCameraFrame = MutableStateFlow<Mat?>(null)
     val latestCameraFrame: StateFlow<Mat?> = _latestCameraFrame
 
+    // Holds the exact frame submitted to OCR for the current detections
+    private val _ocrSourceFrame = MutableStateFlow<Mat?>(null)
+    val ocrSourceFrame: StateFlow<Mat?> = _ocrSourceFrame
+
     // Holds the latest OCR detection results
     private val _currentDetections = MutableStateFlow<List<OcrService.DetectionResult>>(emptyList())
     val currentDetections: StateFlow<List<OcrService.DetectionResult>> = _currentDetections
@@ -43,6 +47,13 @@ object FrameOcrRepository {
         }
     }
 
+    fun updateOcrSourceFrame(frame: Mat) {
+        synchronized(frameLock) {
+            _ocrSourceFrame.value?.release()
+            _ocrSourceFrame.value = frame.clone()
+        }
+    }
+
     fun snapshotCurrentFrame(): Mat? {
         synchronized(frameLock) {
             val frame = _currentFrame.value ?: return null
@@ -54,6 +65,14 @@ object FrameOcrRepository {
     fun snapshotLatestCameraFrame(): Mat? {
         synchronized(frameLock) {
             val frame = _latestCameraFrame.value ?: return null
+            if (frame.empty()) return null
+            return frame.clone()
+        }
+    }
+
+    fun snapshotOcrSourceFrame(): Mat? {
+        synchronized(frameLock) {
+            val frame = _ocrSourceFrame.value ?: return null
             if (frame.empty()) return null
             return frame.clone()
         }
@@ -74,6 +93,13 @@ object FrameOcrRepository {
         synchronized(frameLock) {
             _currentFrame.value?.release()
             _currentFrame.value = null
+        }
+    }
+
+    fun clearOcrSourceFrame() {
+        synchronized(frameLock) {
+            _ocrSourceFrame.value?.release()
+            _ocrSourceFrame.value = null
         }
     }
 }

@@ -277,10 +277,13 @@ class SceneTextReplacer(
         inpaintedBgr: Mat
     ): List<DrawItem> {
         return items.map { item ->
+            stableTextColors[item.stableKey]?.let { lockedColor ->
+                return@map item.copy(color = lockedColor)
+            }
             val backgroundColor = estimateBackgroundColor(inpaintedBgr, item.box)
             val rawTextColor = estimateTextColor(originalBgr, item.result, backgroundColor)
             val contrasted = enforceTextContrast(rawTextColor, backgroundColor)
-            val finalTextColor = stabilizeTextColor(item.stableKey, contrasted, backgroundColor)
+            val finalTextColor = stabilizeTextColor(item.stableKey, contrasted)
             item.copy(color = finalTextColor)
         }
     }
@@ -298,27 +301,9 @@ class SceneTextReplacer(
 
     private fun stabilizeTextColor(
         key: String,
-        candidate: Int,
-        backgroundColor: Int
+        candidate: Int
     ): Int {
-        val previous = stableTextColors[key]
-        val stabilized = if (previous == null) {
-            candidate
-        } else {
-            val previousDistance = colorDistance(previous, backgroundColor)
-            val candidateDistance = colorDistance(candidate, backgroundColor)
-            val previousTone = toneBucket(previous)
-            val candidateTone = toneBucket(candidate)
-
-            if (previousTone != candidateTone &&
-                candidateDistance < previousDistance + COLOR_SWITCH_HYSTERESIS
-            ) {
-                previous
-            } else {
-                candidate
-            }
-        }
-
+        val stabilized = stableTextColors[key] ?: candidate
         stableTextColors[key] = stabilized
         while (stableTextColors.size > COLOR_HISTORY_LIMIT) {
             val firstKey = stableTextColors.entries.firstOrNull()?.key ?: break
@@ -881,10 +866,17 @@ class SceneTextReplacer(
         maxHeight: Int,
         item: DrawItem
     ) {
-        val x1 = item.box.left.coerceAtLeast(0)
-        val y1 = item.box.top.coerceAtLeast(0)
-        val x2 = item.box.right.coerceAtMost(maxWidth)
-        val y2 = item.box.bottom.coerceAtMost(maxHeight)
+        val layoutBox = computeLayoutBox(item.result, item.box)
+        val visibleLeft = layoutBox.left.coerceAtLeast(0)
+        val visibleTop = layoutBox.top.coerceAtLeast(0)
+        val visibleRight = layoutBox.right.coerceAtMost(maxWidth)
+        val visibleBottom = layoutBox.bottom.coerceAtMost(maxHeight)
+        if (visibleRight <= visibleLeft || visibleBottom <= visibleTop) return
+
+        val x1 = layoutBox.left
+        val y1 = layoutBox.top
+        val x2 = layoutBox.right
+        val y2 = layoutBox.bottom
         val boxWidth = (x2 - x1).toFloat()
         val boxHeight = (y2 - y1).toFloat()
         if (boxWidth <= 0 || boxHeight <= 0) return
@@ -921,6 +913,22 @@ class SceneTextReplacer(
         } else {
             canvas.drawText(item.text, drawX, drawY, textPaint)
         }
+    }
+
+    private fun computeLayoutBox(
+        result: OcrService.DetectionResult,
+        fallbackBox: android.graphics.Rect
+    ): android.graphics.Rect {
+        val points = result.cornerPoints
+        if (points == null || points.isEmpty()) return fallbackBox
+
+        val left = points.minOf { it.x }
+        val top = points.minOf { it.y }
+        val right = points.maxOf { it.x }
+        val bottom = points.maxOf { it.y }
+        if (right <= left || bottom <= top) return fallbackBox
+
+        return android.graphics.Rect(left, top, right, bottom)
     }
 
     private fun computeTextAngle(result: OcrService.DetectionResult): Float {

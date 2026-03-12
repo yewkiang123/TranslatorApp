@@ -2,6 +2,7 @@ package com.example.translatorapp.ocr
 
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.camera.core.ExperimentalGetImage
@@ -28,6 +29,13 @@ import kotlin.coroutines.resumeWithException
 
 class OcrService : ImageAnalysis.Analyzer {
 
+    data class OcrDetectionEvent(
+        val results: List<DetectionResult>,
+        val frameCapturedAtMs: Long,
+        val stableAtMs: Long,
+        val ocrCompletedAtMs: Long
+    )
+
     data class TextRegion(
         val boundingBox: Rect?,
         val cornerPoints: Array<android.graphics.Point>? = null
@@ -53,6 +61,10 @@ class OcrService : ImageAnalysis.Analyzer {
 
     private val _detections = MutableSharedFlow<List<DetectionResult>>()
     val detections: SharedFlow<List<DetectionResult>> = _detections.asSharedFlow()
+    private val _detectionEvents = MutableSharedFlow<OcrDetectionEvent>()
+    val detectionEvents: SharedFlow<OcrDetectionEvent> = _detectionEvents.asSharedFlow()
+    private val _analyzerFrames = MutableSharedFlow<Long>(extraBufferCapacity = 32)
+    val analyzerFrames: SharedFlow<Long> = _analyzerFrames.asSharedFlow()
     private val _motionStable = MutableSharedFlow<Boolean>(replay = 1)
     val motionStable: SharedFlow<Boolean> = _motionStable.asSharedFlow()
 
@@ -79,6 +91,9 @@ class OcrService : ImageAnalysis.Analyzer {
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
+        val frameCapturedAtMs = SystemClock.elapsedRealtime()
+        _analyzerFrames.tryEmit(frameCapturedAtMs)
+
         if (!OpenCVInitializer.isReady()) {
             imageProxy.close()
             return
@@ -112,6 +127,7 @@ class OcrService : ImageAnalysis.Analyzer {
             imageProxy.close()
             return
         }
+        val stableAtMs = SystemClock.elapsedRealtime()
         if (!ocrArmed) {
             fullMat.release()
             imageProxy.close()
@@ -123,6 +139,7 @@ class OcrService : ImageAnalysis.Analyzer {
             return
         }
 
+        FrameOcrRepository.updateOcrSourceFrame(fullMat)
         val bitmap = matToBitmap(fullMat) ?: run {
             fullMat.release()
             imageProxy.close()
@@ -204,8 +221,17 @@ class OcrService : ImageAnalysis.Analyzer {
                     preferredRecognizer = recognizerHitCounts.maxByOrNull { it.value }?.key ?: preferredRecognizer
                 }
 
+                val ocrCompletedAtMs = SystemClock.elapsedRealtime()
+                _detections.emit(results)
+                _detectionEvents.emit(
+                    OcrDetectionEvent(
+                        results = results,
+                        frameCapturedAtMs = frameCapturedAtMs,
+                        stableAtMs = stableAtMs,
+                        ocrCompletedAtMs = ocrCompletedAtMs
+                    )
+                )
                 if (results.isNotEmpty()) {
-                    _detections.emit(results)
                     Log.d("OCR", "Detected ${results.size} text lines")
 
                     // Update shared repository
