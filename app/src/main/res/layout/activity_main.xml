@@ -36,8 +36,9 @@
             android:id="@+id/processedOverlay"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:background="@android:color/white"
-            android:scaleType="fitCenter" />
+            android:background="@android:color/transparent"
+            android:scaleType="fitCenter"
+            android:visibility="invisible" />
 
         <com.google.android.material.card.MaterialCardView
             android:id="@+id/processingIndicatorCard"

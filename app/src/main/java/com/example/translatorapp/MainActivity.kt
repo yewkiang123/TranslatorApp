@@ -187,6 +187,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     private var renderJob: Job? = null
     private var trackingJob: Job? = null
+    private var pendingRedetectJob: Job? = null
     @Volatile private var overlayEnabled = false
     @Volatile private var needsFreshInpaint = true
     @Volatile private var freezeFrameMode = false
@@ -199,23 +200,26 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private var trackingAnchorGray: Mat? = null
     private var trackingAccumulatedTransform = TrackingTransform()
     private var trackingMissCount = 0
+    @Volatile private var cameraMotionStable = false
+    @Volatile private var redetectAfterMotionStops = true
     private val trackIntervalMs = 45L
-    private val maxTrackingMisses = 5
-    private val panThresholdPx = 140.0
+    private val redetectSettleDelayMs = 350L
+    private val maxTrackingMisses = 8
+    private val panThresholdPx = 220.0
     private val minTrackShiftPx = 1.5
-    private val maxTrackStepPx = 60.0
+    private val maxTrackStepPx = 96.0
     private val minScaleDelta = 0.015
     private val minTrackScale = 0.82
     private val maxTrackScale = 1.22
-    private val zoomResetThreshold = 0.22
-    private val trackingFeatureCount = 320
+    private val zoomResetThreshold = 0.28
+    private val trackingFeatureCount = 420
     private val trackingFeatureQualityLevel = 0.005
     private val trackingFeatureMinDistance = 4.0
     private val minTrackingRoiSizePx = 180
     private val minTrackingTargetTextSizePx = 56.0
     private val maxTrackingUpscale = 4.0
-    private val trackingFlowWindowSize = Size(31.0, 31.0)
-    private val trackingFlowMaxLevel = 4
+    private val trackingFlowWindowSize = Size(41.0, 41.0)
+    private val trackingFlowMaxLevel = 5
     private val minTrackingValidPoints = 6
     private val minTrackingTranslationPoints = 3
     private val minTrackingAffineInliers = 4
@@ -337,10 +341,17 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
         ocrService.motionStable.onEach { stable ->
             if (!freezeFrameMode) {
+                cameraMotionStable = stable
                 if (stable) {
-                    setDetectingActive(true)
+                    if (redetectAfterMotionStops) {
+                        scheduleRedetectionAfterSettle()
+                    } else {
+                        setDetectingActive(false)
+                    }
                 } else {
-                    clearTrackingState()
+                    cancelPendingRedetection()
+                    hideOverlayOnly()
+                    redetectAfterMotionStops = true
                     setNoTextDetected(false)
                     setDetectingActive(false)
                 }
@@ -366,6 +377,25 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             }
         }
         renderProcessingIndicator()
+    }
+
+    private fun scheduleRedetectionAfterSettle() {
+        pendingRedetectJob?.cancel()
+        pendingRedetectJob = lifecycleScope.launch {
+            kotlinx.coroutines.delay(redetectSettleDelayMs)
+            if (!isActive || freezeFrameMode || !cameraMotionStable || !redetectAfterMotionStops) {
+                return@launch
+            }
+            ocrService.requestImmediateRefresh()
+            lastProcessTime = 0L
+            redetectAfterMotionStops = false
+            setDetectingActive(true)
+        }
+    }
+
+    private fun cancelPendingRedetection() {
+        pendingRedetectJob?.cancel()
+        pendingRedetectJob = null
     }
 
     private fun showNoTextDetected() {
@@ -831,7 +861,8 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
         if (estimatedTransform == null && missCount > maxTrackingMisses) {
             currentGray.release()
-            clearTrackingState()
+            clearTrackingState(clearDisplayedOverlay = false)
+            requestRedetectionAfterTrackingLoss()
             frame.release()
             return
         }
@@ -839,7 +870,8 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         if (measureTransformMotion(stepTransform, referencePivot) > panThresholdPx ||
             abs(stepTransform.scale - 1.0) > zoomResetThreshold) {
             currentGray.release()
-            clearTrackingState()
+            clearTrackingState(clearDisplayedOverlay = false)
+            requestRedetectionAfterTrackingLoss()
             frame.release()
             return
         }
@@ -854,6 +886,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         if (shifted.none { it.boundingBox != null }) {
             currentGray.release()
             clearTrackingState()
+            requestRedetectionAfterTrackingLoss()
             frame.release()
             return
         }
@@ -979,7 +1012,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             prevTracking.release()
             currentTracking.release()
             points.release()
-            return null
+            return estimateGlobalTranslationFallback(prev, current, referencePivot)
         }
 
         val prevPts = MatOfPoint2f(*points.toArray())
@@ -1024,7 +1057,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
 
         if (prevValid.size < minTrackingTranslationPoints) {
-            return null
+            return estimateGlobalTranslationFallback(prev, current, referencePivot)
         }
 
         val motionStats = computeTrackingMotionStats(prevValid, nextValid)
@@ -1068,7 +1101,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 nextPoints = nextValid,
                 referencePivot = referencePivot,
                 motionStats = motionStats
-            )
+            ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
         }
         if (inlierCount < minTrackingAffineInliers) {
             affine.release()
@@ -1077,7 +1110,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 nextPoints = nextValid,
                 referencePivot = referencePivot,
                 motionStats = motionStats
-            )
+            ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
         }
 
         val rawTransform = TrackingTransform(
@@ -1094,7 +1127,80 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             raw = rawTransform,
             referencePivot = referencePivot,
             motionStats = motionStats
-        )
+        ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
+    }
+
+    private fun estimateGlobalTranslationFallback(
+        prev: Mat,
+        current: Mat,
+        referencePivot: Point
+    ): TrackingTransform? {
+        val points = MatOfPoint()
+        try {
+            Imgproc.goodFeaturesToTrack(
+                prev,
+                points,
+                maxOf(trackingFeatureCount / 2, 120),
+                trackingFeatureQualityLevel,
+                trackingFeatureMinDistance
+            )
+            if (points.empty()) {
+                return null
+            }
+
+            val prevPts = MatOfPoint2f(*points.toArray())
+            val nextPts = MatOfPoint2f()
+            val status = MatOfByte()
+            val err = MatOfFloat()
+
+            try {
+                Video.calcOpticalFlowPyrLK(
+                    prev,
+                    current,
+                    prevPts,
+                    nextPts,
+                    status,
+                    err,
+                    Size(51.0, 51.0),
+                    trackingFlowMaxLevel + 1,
+                    trackingFlowCriteria
+                )
+
+                val prevArr = prevPts.toArray()
+                val nextArr = nextPts.toArray()
+                val statusArr = status.toArray()
+
+                val prevValid = ArrayList<Point>(statusArr.size)
+                val nextValid = ArrayList<Point>(statusArr.size)
+                for (i in statusArr.indices) {
+                    if (statusArr[i].toInt() != 1) continue
+                    val from = prevArr[i]
+                    val to = nextArr[i]
+                    if (!from.x.isFinite() || !from.y.isFinite() || !to.x.isFinite() || !to.y.isFinite()) continue
+                    prevValid.add(from)
+                    nextValid.add(to)
+                }
+
+                if (prevValid.size < minTrackingTranslationPoints) {
+                    return null
+                }
+
+                val motionStats = computeTrackingMotionStats(prevValid, nextValid)
+                return estimateTranslationOnlyTransform(
+                    prevPoints = prevValid,
+                    nextPoints = nextValid,
+                    referencePivot = referencePivot,
+                    motionStats = motionStats
+                )
+            } finally {
+                prevPts.release()
+                nextPts.release()
+                status.release()
+                err.release()
+            }
+        } finally {
+            points.release()
+        }
     }
 
     private fun buildTrackingMask(
@@ -1163,8 +1269,8 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         val contentWidth = (contentRight - contentLeft).coerceAtLeast(1)
         val contentHeight = (contentBottom - contentTop).coerceAtLeast(1)
 
-        val padX = maxOf(contentWidth * 1.25, 56.0)
-        val padY = maxOf(contentHeight * 1.4, 56.0)
+        val padX = maxOf(contentWidth * 1.8, 84.0)
+        val padY = maxOf(contentHeight * 1.9, 84.0)
         val targetWidth = maxOf(contentWidth + padX * 2.0, minTrackingRoiSizePx.toDouble())
         val targetHeight = maxOf(contentHeight + padY * 2.0, minTrackingRoiSizePx.toDouble())
         val centerX = (contentLeft + contentRight) / 2.0
@@ -1630,7 +1736,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
     }
 
-    private fun clearTrackingState() {
+    private fun clearTrackingState(clearDisplayedOverlay: Boolean = true) {
         synchronized(trackingLock) {
             trackedResults.clear()
             trackedBaseResults.clear()
@@ -1641,31 +1747,51 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             trackingMissCount = 0
         }
         translationCache.clear()
-        FrameOcrRepository.clearFrame()
         FrameOcrRepository.clearOcrSourceFrame()
-        overlayEnabled = false
         needsFreshInpaint = true
         synchronized(metricsLock) {
             activeMetricsSession = null
         }
-        setGeneratedTextVisible(false)
         replacer.clearStableState()
-        runOnUiThread {
-            binding.processedOverlay.setImageBitmap(null)
-            binding.processedOverlay.visibility = View.INVISIBLE
+        if (clearDisplayedOverlay) {
+            FrameOcrRepository.clearFrame()
+            overlayEnabled = false
+            setGeneratedTextVisible(false)
+            runOnUiThread {
+                binding.processedOverlay.setImageBitmap(null)
+                binding.processedOverlay.visibility = View.INVISIBLE
+            }
         }
     }
+
+    private fun requestRedetectionAfterTrackingLoss() {
+        lastProcessTime = 0L
+        setNoTextDetected(false)
+        if (cameraMotionStable) {
+            redetectAfterMotionStops = true
+            scheduleRedetectionAfterSettle()
+        } else {
+            cancelPendingRedetection()
+            redetectAfterMotionStops = true
+            setDetectingActive(false)
+        }
+    }
+
     private fun clearDetectedBlocks() {
         resetDetectionSession()
         Log.d(TAG, "Reset detection session due to language change")
     }
 
     private fun resetDetectionSession() {
+        cancelPendingRedetection()
         clearTrackingState()
         ocrService.resetSessionState()
+        cameraMotionStable = false
+        redetectAfterMotionStops = true
         lastProcessTime = 0L
         resetProcessingWork(keepDetecting = !freezeFrameMode && isOpenCvReady)
     }
+
     private fun processOnInterval(event: OcrService.OcrDetectionEvent) {
         if (freezeFrameMode) return
 
@@ -2100,6 +2226,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     private fun startCameraWithOcr() {
         resetRuntimeMetrics()
+        redetectAfterMotionStops = true
         if (!isOpenCvReady) {
             cameraController.startCamera()
             setDetectingActive(false)
@@ -2476,6 +2603,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         cameraController.stopCamera()
         ocrService.cleanup()
         translationService.cleanup()
+        cancelPendingRedetection()
         trackingJob?.cancel()
         synchronized(trackingLock) {
             trackingAnchorGray?.release()

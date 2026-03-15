@@ -87,11 +87,11 @@ class OcrService : ImageAnalysis.Analyzer {
     private var preferredRecognizer = "latin"
     private var nextOcrRequestId = 1L
     private var lastPeriodicRearmAtMs = 0L
-    var ocrBurstFrames = 2
+    var ocrBurstFrames = 1
     private var ocrFramesProcessed = 0
     var recognizerTimeoutMs = 700L
     var fallbackRecognizerTimeoutMs = 500L
-    var periodicRefreshIntervalMs = 2500L
+    var periodicRefreshIntervalMs = 0L
 
     var motionThreshold = 10.5
     var stableHoldMs = 700L
@@ -265,16 +265,16 @@ class OcrService : ImageAnalysis.Analyzer {
                         ocrCompletedAtMs = ocrCompletedAtMs
                     )
                 )
+                ocrFramesProcessed++
+                if (ocrFramesProcessed >= ocrBurstFrames) {
+                    ocrArmed = false
+                    lastPeriodicRearmAtMs = ocrCompletedAtMs
+                }
                 if (results.isNotEmpty()) {
                     Log.d("OCR", "Detected ${results.size} text lines")
 
                     // Update shared repository
                     FrameOcrRepository.updateDetections(results)
-                    ocrFramesProcessed++
-                    if (ocrFramesProcessed >= ocrBurstFrames) {
-                        ocrArmed = false
-                        lastPeriodicRearmAtMs = ocrCompletedAtMs
-                    }
                 }
 
             } catch (e: Exception) {
