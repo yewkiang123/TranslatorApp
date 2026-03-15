@@ -1681,9 +1681,10 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         val results = rawResults.map { result ->
             result.copy(stableId = result.stableId ?: "det-${nextStableDetectionId++}")
         }
-        val baseFrame = FrameOcrRepository.snapshotOcrSourceFrame()
+        val baseFrame = FrameOcrRepository.snapshotOcrSourceFrame(event.requestId)
             ?: FrameOcrRepository.snapshotLatestCameraFrame()
             ?: return
+        FrameOcrRepository.discardOcrSourceFrame(event.requestId)
         if (baseFrame.empty() || baseFrame.cols() <= 0 || baseFrame.rows() <= 0) {
             baseFrame.release()
             return
