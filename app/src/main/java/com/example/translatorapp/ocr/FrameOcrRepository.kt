@@ -1,6 +1,5 @@
 package com.example.translatorapp.ocr
 
-import android.graphics.Rect
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.opencv.core.Mat
@@ -9,7 +8,14 @@ import org.opencv.core.Mat
  * Singleton to hold the current camera frame and latest OCR results.
  */
 object FrameOcrRepository {
+    private const val MAX_PENDING_OCR_SOURCE_FRAMES = 4
+
     private val frameLock = Any()
+    private val ocrSourceFrames = PendingRequestStore<Mat>(
+        maxEntries = MAX_PENDING_OCR_SOURCE_FRAMES,
+        duplicate = { frame -> frame.clone() },
+        release = { frame -> frame.release() }
+    )
 
     // Holds the latest processed frame (with overlays)
     private val _currentFrame = MutableStateFlow<Mat?>(null)
@@ -18,10 +24,6 @@ object FrameOcrRepository {
     // Holds the latest raw camera frame
     private val _latestCameraFrame = MutableStateFlow<Mat?>(null)
     val latestCameraFrame: StateFlow<Mat?> = _latestCameraFrame
-
-    // Holds the exact frame submitted to OCR for the current detections
-    private val _ocrSourceFrame = MutableStateFlow<Mat?>(null)
-    val ocrSourceFrame: StateFlow<Mat?> = _ocrSourceFrame
 
     // Holds the latest OCR detection results
     private val _currentDetections = MutableStateFlow<List<OcrService.DetectionResult>>(emptyList())
@@ -47,10 +49,9 @@ object FrameOcrRepository {
         }
     }
 
-    fun updateOcrSourceFrame(frame: Mat) {
+    fun updateOcrSourceFrame(requestId: Long, frame: Mat) {
         synchronized(frameLock) {
-            _ocrSourceFrame.value?.release()
-            _ocrSourceFrame.value = frame.clone()
+            ocrSourceFrames.put(requestId, frame)
         }
     }
 
@@ -70,11 +71,20 @@ object FrameOcrRepository {
         }
     }
 
-    fun snapshotOcrSourceFrame(): Mat? {
+    fun snapshotOcrSourceFrame(requestId: Long): Mat? {
         synchronized(frameLock) {
-            val frame = _ocrSourceFrame.value ?: return null
-            if (frame.empty()) return null
-            return frame.clone()
+            val frame = ocrSourceFrames.snapshot(requestId) ?: return null
+            if (frame.empty()) {
+                frame.release()
+                return null
+            }
+            return frame
+        }
+    }
+
+    fun discardOcrSourceFrame(requestId: Long) {
+        synchronized(frameLock) {
+            ocrSourceFrames.discard(requestId)
         }
     }
 
@@ -98,8 +108,7 @@ object FrameOcrRepository {
 
     fun clearOcrSourceFrame() {
         synchronized(frameLock) {
-            _ocrSourceFrame.value?.release()
-            _ocrSourceFrame.value = null
+            ocrSourceFrames.clear()
         }
     }
 }

@@ -30,6 +30,7 @@ import kotlin.coroutines.resumeWithException
 class OcrService : ImageAnalysis.Analyzer {
 
     data class OcrDetectionEvent(
+        val requestId: Long,
         val results: List<DetectionResult>,
         val frameCapturedAtMs: Long,
         val stableAtMs: Long,
@@ -69,26 +70,35 @@ class OcrService : ImageAnalysis.Analyzer {
     private val _motionStable = MutableSharedFlow<Boolean>(replay = 1)
     val motionStable: SharedFlow<Boolean> = _motionStable.asSharedFlow()
 
-    private val seenBoxes = mutableListOf<Rect>()
+    private val seenDetections = mutableListOf<SeenDetection>()
     private val scope = CoroutineScope(Dispatchers.Default)
     private var prevGraySmall: Mat? = null
     private var lastMotionTimeMs = 0L
     private var unstableSinceMs = 0L
     private var lastStableState: Boolean? = null
+    private val ocrRequestLock = Any()
+    private val activeRequestScanGenerations = HashSet<Long>()
+    @Volatile private var blockOcrUntilMs = 0L
+    @Volatile private var motionRevision = 0L
+    @Volatile private var scanGeneration = 0L
     @Volatile private var ocrArmed = true
-    @Volatile private var ocrInFlight = false
     @Volatile private var sourceLanguageHint = "auto"
     @Volatile private var sessionResetRequested = false
     private var preferredRecognizer = "latin"
+    private var nextOcrRequestId = 1L
+    private var lastPeriodicRearmAtMs = 0L
     var ocrBurstFrames = 2
     private var ocrFramesProcessed = 0
-    var recognizerTimeoutMs = 900L
-    var earlyExitMinLines = 2
+    var recognizerTimeoutMs = 700L
+    var fallbackRecognizerTimeoutMs = 500L
+    var periodicRefreshIntervalMs = 2500L
 
     var motionThreshold = 10.5
-    var stableHoldMs = 1200L
+    var stableHoldMs = 700L
     var unstableHoldMs = 1000L
+    var activationBlockThreshold = 13.0
     var hardMotionThreshold = 19.0
+    var motionCooldownMs = 350L
 
     @OptIn(ExperimentalGetImage::class)
     override fun analyze(imageProxy: ImageProxy) {
@@ -129,25 +139,29 @@ class OcrService : ImageAnalysis.Analyzer {
             return
         }
         val stableAtMs = SystemClock.elapsedRealtime()
+        armPeriodicRefreshIfDue(stableAtMs)
         if (!ocrArmed) {
             fullMat.release()
             imageProxy.close()
             return
         }
-        if (ocrInFlight) {
+        val requestMotionRevision = motionRevision
+        val requestScanGeneration = scanGeneration
+        if (!tryStartOcrRequest(requestScanGeneration)) {
             fullMat.release()
             imageProxy.close()
             return
         }
-
-        FrameOcrRepository.updateOcrSourceFrame(fullMat)
+        val requestId = nextOcrRequestId++
+        FrameOcrRepository.updateOcrSourceFrame(requestId, fullMat)
         val bitmap = matToBitmap(fullMat) ?: run {
+            finishOcrRequest(requestScanGeneration)
+            FrameOcrRepository.discardOcrSourceFrame(requestId)
             fullMat.release()
             imageProxy.close()
             return
         }
         val image = InputImage.fromBitmap(bitmap, 0)
-        ocrInFlight = true
         fullMat.release()
         imageProxy.close()
 
@@ -161,8 +175,14 @@ class OcrService : ImageAnalysis.Analyzer {
                 for ((index, lang) in orderedRecognizers.withIndex()) {
                     val recognizer = recognizers[lang] ?: continue
                     var recognizerFoundCount = 0
+                    val timeoutMs = OcrRecognizerPolicy.timeoutForRecognizer(
+                        isAutoSource = isAutoSource,
+                        recognizerIndex = index,
+                        primaryTimeoutMs = recognizerTimeoutMs,
+                        fallbackTimeoutMs = fallbackRecognizerTimeoutMs
+                    )
                     try {
-                        val textResult = withTimeout(recognizerTimeoutMs) {
+                        val textResult = withTimeout(timeoutMs) {
                             recognizer.process(image).await()
                         }
 
@@ -171,9 +191,11 @@ class OcrService : ImageAnalysis.Analyzer {
                             val blockCorners = block.cornerPoints
                             for (line in block.lines) {
                                 val box = line.boundingBox ?: continue
-                                if (isDuplicateBox(box)) continue
+                                if (isDuplicateDetection(line.text, box)) continue
 
-                                seenBoxes.add(box)
+                                seenDetections.add(
+                                    OcrDuplicatePolicy.createSeenDetection(line.text, box)
+                                )
                                 recognizerFoundCount++
                                 val textRegions = line.elements.mapNotNull { element ->
                                     val elementBox = element.boundingBox
@@ -210,9 +232,10 @@ class OcrService : ImageAnalysis.Analyzer {
                         recognizerHitCounts[lang] = recognizerFoundCount
                     }
 
-                    if (isAutoSource &&
-                        index == 0 &&
-                        recognizerFoundCount >= earlyExitMinLines
+                    if (OcrRecognizerPolicy.shouldStopAfterRecognizer(
+                            isAutoSource = isAutoSource,
+                            recognizerFoundCount = recognizerFoundCount
+                        )
                     ) {
                         break
                     }
@@ -223,9 +246,19 @@ class OcrService : ImageAnalysis.Analyzer {
                 }
 
                 val ocrCompletedAtMs = SystemClock.elapsedRealtime()
+                if (!shouldAcceptOcrResult(
+                        requestMotionRevision = requestMotionRevision,
+                        requestScanGeneration = requestScanGeneration,
+                        nowAtMs = ocrCompletedAtMs
+                    )
+                ) {
+                    FrameOcrRepository.discardOcrSourceFrame(requestId)
+                    return@launch
+                }
                 _detections.emit(results)
                 _detectionEvents.emit(
                     OcrDetectionEvent(
+                        requestId = requestId,
                         results = results,
                         frameCapturedAtMs = frameCapturedAtMs,
                         stableAtMs = stableAtMs,
@@ -240,14 +273,16 @@ class OcrService : ImageAnalysis.Analyzer {
                     ocrFramesProcessed++
                     if (ocrFramesProcessed >= ocrBurstFrames) {
                         ocrArmed = false
+                        lastPeriodicRearmAtMs = ocrCompletedAtMs
                     }
                 }
 
             } catch (e: Exception) {
                 Log.e("OCR", "Error in analysis", e)
+                FrameOcrRepository.discardOcrSourceFrame(requestId)
             } finally {
                 bitmap.recycle()
-                ocrInFlight = false
+                finishOcrRequest(requestScanGeneration)
             }
         }
     }
@@ -259,14 +294,22 @@ class OcrService : ImageAnalysis.Analyzer {
     private fun applyPendingSessionReset() {
         if (!sessionResetRequested) return
         sessionResetRequested = false
-        seenBoxes.clear()
+        seenDetections.clear()
         prevGraySmall?.release()
         prevGraySmall = null
         lastMotionTimeMs = 0L
         unstableSinceMs = 0L
         lastStableState = null
+        synchronized(ocrRequestLock) {
+            activeRequestScanGenerations.clear()
+        }
+        blockOcrUntilMs = 0L
+        motionRevision = 0L
+        scanGeneration = 0L
         ocrArmed = true
         ocrFramesProcessed = 0
+        nextOcrRequestId = 1L
+        lastPeriodicRearmAtMs = 0L
         preferredRecognizer = languageCodeToRecognizer(sourceLanguageHint)
     }
 
@@ -312,7 +355,7 @@ class OcrService : ImageAnalysis.Analyzer {
     }
 
     private fun updateMotionState(frame: Mat): Boolean {
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
 
         val gray = Mat()
         when (frame.channels()) {
@@ -341,35 +384,40 @@ class OcrService : ImageAnalysis.Analyzer {
         diff.release()
 
         val motion = mean.`val`[0]
-        if (motion > hardMotionThreshold) {
-            lastMotionTimeMs = now
-            unstableSinceMs = now - unstableHoldMs
-            seenBoxes.clear()
-        } else if (motion > motionThreshold) {
-            lastMotionTimeMs = now
-            if (unstableSinceMs == 0L) unstableSinceMs = now
-        } else {
-            unstableSinceMs = 0L
+        val motionDecision = OcrMotionPolicy.evaluate(
+            motion = motion,
+            nowAtMs = now,
+            lastMotionAtMs = lastMotionTimeMs,
+            unstableSinceMs = unstableSinceMs,
+            lastStableState = lastStableState,
+            blockOcrUntilMs = blockOcrUntilMs,
+            motionThreshold = motionThreshold,
+            activationBlockThreshold = activationBlockThreshold,
+            hardMotionThreshold = hardMotionThreshold,
+            stableHoldMs = stableHoldMs,
+            unstableHoldMs = unstableHoldMs,
+            motionCooldownMs = motionCooldownMs
+        )
+        lastMotionTimeMs = motionDecision.lastMotionAtMs
+        unstableSinceMs = motionDecision.unstableSinceMs
+        blockOcrUntilMs = motionDecision.blockOcrUntilMs
+        val wasStable = lastStableState == true
+        if (motionDecision.invalidateInFlightRequests) {
+            motionRevision++
+            seenDetections.clear()
         }
 
         prev.release()
         prevGraySmall = small.clone()
         small.release()
 
-        val stableEnough = (now - lastMotionTimeMs) >= stableHoldMs
-        val unstableEnough = unstableSinceMs != 0L && (now - unstableSinceMs) >= unstableHoldMs
-
-        val stable = when {
-            unstableEnough -> false
-            stableEnough -> true
-            else -> (lastStableState == true)
-        }
-        if (!stable && lastStableState == true) {
-            // Only reset OCR when we truly transitioned to unstable
+        val stable = motionDecision.stable
+        if (stable && !wasStable) {
+            scanGeneration++
             ocrArmed = true
             ocrFramesProcessed = 0
-            seenBoxes.clear()
-            preferredRecognizer = "latin"
+            seenDetections.clear()
+            lastPeriodicRearmAtMs = 0L
         }
         return stable
     }
@@ -384,13 +432,57 @@ class OcrService : ImageAnalysis.Analyzer {
         }
     }
 
-    private fun isDuplicateBox(box: Rect): Boolean {
-        return seenBoxes.any { existingBox ->
-            kotlin.math.abs(existingBox.top - box.top) <= 2 &&
-                    kotlin.math.abs(existingBox.bottom - box.bottom) <= 2 &&
-                    kotlin.math.abs(existingBox.left - box.left) <= 2 &&
-                    kotlin.math.abs(existingBox.right - box.right) <= 2
+    private fun shouldAcceptOcrResult(
+        requestMotionRevision: Long,
+        requestScanGeneration: Long,
+        nowAtMs: Long
+    ): Boolean {
+        return OcrMotionPolicy.shouldAcceptResult(
+            requestMotionRevision = requestMotionRevision,
+            currentMotionRevision = motionRevision,
+            requestScanGeneration = requestScanGeneration,
+            currentScanGeneration = scanGeneration,
+            nowAtMs = nowAtMs,
+            blockOcrUntilMs = blockOcrUntilMs,
+            isStable = lastStableState == true
+        )
+    }
+
+    private fun tryStartOcrRequest(requestScanGeneration: Long): Boolean {
+        synchronized(ocrRequestLock) {
+            if (activeRequestScanGenerations.contains(requestScanGeneration)) {
+                return false
+            }
+            activeRequestScanGenerations.add(requestScanGeneration)
+            return true
         }
+    }
+
+    private fun finishOcrRequest(requestScanGeneration: Long) {
+        synchronized(ocrRequestLock) {
+            activeRequestScanGenerations.remove(requestScanGeneration)
+        }
+    }
+
+    private fun armPeriodicRefreshIfDue(nowAtMs: Long) {
+        if (!OcrRefreshPolicy.shouldRunPeriodicRefresh(
+                isArmed = ocrArmed,
+                lastRearmAtMs = lastPeriodicRearmAtMs,
+                nowAtMs = nowAtMs,
+                refreshIntervalMs = periodicRefreshIntervalMs
+            )
+        ) {
+            return
+        }
+
+        ocrArmed = true
+        ocrFramesProcessed = 0
+        seenDetections.clear()
+        lastPeriodicRearmAtMs = nowAtMs
+    }
+
+    private fun isDuplicateDetection(text: String, box: Rect): Boolean {
+        return OcrDuplicatePolicy.isDuplicate(text, box, seenDetections)
     }
     private fun rotateMat(src: Mat, rotationDegrees: Int): Mat {
         if (rotationDegrees == 0) return src
@@ -406,7 +498,14 @@ class OcrService : ImageAnalysis.Analyzer {
         return dst
     }
     fun resetCache() {
-        seenBoxes.clear()
+        seenDetections.clear()
+    }
+
+    fun requestImmediateRefresh() {
+        ocrArmed = true
+        ocrFramesProcessed = 0
+        seenDetections.clear()
+        lastPeriodicRearmAtMs = 0L
     }
 
     fun resetSessionState() {
