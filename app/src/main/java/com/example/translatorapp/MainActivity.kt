@@ -188,12 +188,14 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private var renderJob: Job? = null
     private var trackingJob: Job? = null
     @Volatile private var overlayEnabled = false
+    @Volatile private var needsFreshInpaint = true
     @Volatile private var freezeFrameMode = false
     private var frozenFrameBitmap: Bitmap? = null
     private val trackingLock = Any()
     private var trackedResults: MutableList<OcrService.DetectionResult> = mutableListOf()
     private var trackedBaseResults: MutableList<OcrService.DetectionResult> = mutableListOf()
     private var trackedTranslations: MutableList<String> = mutableListOf()
+    private var nextStableDetectionId = 1L
     private var trackingAnchorGray: Mat? = null
     private var trackingAccumulatedTransform = TrackingTransform()
     private var trackingMissCount = 0
@@ -870,13 +872,18 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
         setGeneratingActive(true)
         try {
-            val updated = replacer.replaceText(frame, shifted, snapshot.translations)
+            val updated = replacer.replaceText(
+                frame = frame,
+                detectionResults = shifted,
+                translatedTexts = snapshot.translations,
+                reuseTrackedInpaint = !needsFreshInpaint
+            )
             try {
                 if (updated.empty() || updated.cols() <= 0 || updated.rows() <= 0) {
-                    hideOverlayOnly()
                     return
                 }
                 FrameOcrRepository.updateFrame(updated)
+                needsFreshInpaint = false
             } finally {
                 updated.release()
             }
@@ -887,7 +894,6 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed generating processed frame", e)
-            hideOverlayOnly()
         } finally {
             setGeneratingActive(false)
             frame.release()
@@ -1451,9 +1457,10 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             val shiftedBox = shiftedCorners?.let { boundsFromPoints(it, maxW, maxH) }
                 ?: result.boundingBox?.let { shiftRect(it, transform, maxW, maxH) }
 
-            val shiftedBlockCorners = shiftPoints(result.blockCornerPoints, transform, maxW, maxH)
-            val shiftedBlockBox = shiftedBlockCorners?.let { boundsFromPoints(it, maxW, maxH) }
-                ?: result.blockBoundingBox?.let { shiftRect(it, transform, maxW, maxH) }
+            val shiftedBlockBox = (result.blockBoundingBox ?: result.boundingBox)?.let {
+                shiftRectKeepingSize(it, transform, maxW, maxH)
+            }
+            val shiftedBlockCorners = shiftedBlockBox?.let { rectToPoints(it) }
 
             val shiftedTextRegions = result.textRegions.mapNotNull { region ->
                 val shiftedRegionCorners = shiftPoints(region.cornerPoints, transform, maxW, maxH)
@@ -1478,6 +1485,38 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 textRegions = shiftedTextRegions
             )
         }
+    }
+
+    private fun shiftRectKeepingSize(
+        rect: android.graphics.Rect,
+        transform: TrackingTransform,
+        maxW: Int,
+        maxH: Int
+    ): android.graphics.Rect? {
+        val cx = (rect.left + rect.right) * 0.5
+        val cy = (rect.top + rect.bottom) * 0.5
+        val transformedCenter = transformPoint(cx, cy, transform)
+        val halfWidth = rect.width() / 2.0
+        val halfHeight = rect.height() / 2.0
+
+        val shiftedLeft = floor(transformedCenter.x - halfWidth).toInt()
+        val shiftedTop = floor(transformedCenter.y - halfHeight).toInt()
+        val shiftedRight = ceil(transformedCenter.x + halfWidth).toInt()
+        val shiftedBottom = ceil(transformedCenter.y + halfHeight).toInt()
+
+        if (!TrackingFrameBounds.containsRect(
+                left = shiftedLeft,
+                top = shiftedTop,
+                right = shiftedRight,
+                bottom = shiftedBottom,
+                maxWidth = maxW,
+                maxHeight = maxH
+            )
+        ) {
+            return null
+        }
+
+        return android.graphics.Rect(shiftedLeft, shiftedTop, shiftedRight, shiftedBottom)
     }
 
     private fun shiftRect(
@@ -1564,6 +1603,15 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         return android.graphics.Rect(rawLeft, rawTop, rawRight, rawBottom)
     }
 
+    private fun rectToPoints(rect: android.graphics.Rect): Array<android.graphics.Point> {
+        return arrayOf(
+            android.graphics.Point(rect.left, rect.top),
+            android.graphics.Point(rect.right, rect.top),
+            android.graphics.Point(rect.right, rect.bottom),
+            android.graphics.Point(rect.left, rect.bottom)
+        )
+    }
+
     private fun transformPoint(x: Double, y: Double, transform: TrackingTransform): Point {
         return Point(
             transform.m00 * x + transform.m01 * y + transform.m02,
@@ -1596,10 +1644,12 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         FrameOcrRepository.clearFrame()
         FrameOcrRepository.clearOcrSourceFrame()
         overlayEnabled = false
+        needsFreshInpaint = true
         synchronized(metricsLock) {
             activeMetricsSession = null
         }
         setGeneratedTextVisible(false)
+        replacer.clearStableState()
         runOnUiThread {
             binding.processedOverlay.setImageBitmap(null)
             binding.processedOverlay.visibility = View.INVISIBLE
@@ -1619,7 +1669,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private fun processOnInterval(event: OcrService.OcrDetectionEvent) {
         if (freezeFrameMode) return
 
-        val results = event.results
+        val rawResults = event.results
         val now = System.currentTimeMillis()
         if (now - lastProcessTime <= processInterval) return
         lastProcessTime = now
@@ -1627,6 +1677,9 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             if (trackedResults.isNotEmpty()) {
                 return
             }
+        }
+        val results = rawResults.map { result ->
+            result.copy(stableId = result.stableId ?: "det-${nextStableDetectionId++}")
         }
         val baseFrame = FrameOcrRepository.snapshotOcrSourceFrame()
             ?: FrameOcrRepository.snapshotLatestCameraFrame()
@@ -1650,6 +1703,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             trackingAccumulatedTransform = TrackingTransform()
             trackingMissCount = 0
         }
+        needsFreshInpaint = true
 
         val selectedSourceCode = getLanguageCode(sourceLanguageDisplay)
         val targetLanguage = targetLanguageCode

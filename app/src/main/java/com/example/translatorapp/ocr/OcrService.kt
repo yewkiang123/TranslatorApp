@@ -49,7 +49,8 @@ class OcrService : ImageAnalysis.Analyzer {
         val blockBoundingBox: Rect? = null,
         val blockCornerPoints: Array<android.graphics.Point>? = null,
         val textRegions: List<TextRegion> = emptyList(),
-        val roiMat: Mat? = null
+        val roiMat: Mat? = null,
+        val stableId: String? = null
     )
 
     private val recognizers = mapOf(

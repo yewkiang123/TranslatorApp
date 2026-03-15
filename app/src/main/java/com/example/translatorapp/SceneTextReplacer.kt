@@ -27,8 +27,11 @@ class SceneTextReplacer(
 
     companion object {
         private const val TAG = "SceneTextReplacer"
-        private const val TELEA_INPAINT_RADIUS = 3.0
-        private const val INPAINT_MASK_DILATE_SIZE = 3
+        private const val TELEA_INPAINT_RADIUS = 4.0
+        private const val INPAINT_MASK_DILATE_SIZE = 5
+        private const val INPAINT_BOX_PAD_RATIO_X = 0.14
+        private const val INPAINT_BOX_PAD_RATIO_Y = 0.28
+        private const val INPAINT_BOX_PAD_MIN_PX = 6
         private const val GENERATED_TEXT_SCALE = 0.8f
         private const val ANGLE_SNAP_DEGREES = 1.25f
         private const val COLOR_SWITCH_HYSTERESIS = 36.0
@@ -47,6 +50,10 @@ class SceneTextReplacer(
     private data class InpaintRegion(
         val box: android.graphics.Rect,
         val cornerPoints: Array<android.graphics.Point>? = null
+    )
+
+    private data class CachedInpaintPatch(
+        val bitmap: Bitmap
     )
 
     private data class RgbColor(
@@ -91,11 +98,14 @@ class SceneTextReplacer(
     }
     private val textBounds = android.graphics.Rect()
     private val stableTextColors = LinkedHashMap<String, Int>()
+    private val stableTextSizes = LinkedHashMap<String, Float>()
+    private val stableInpaintPatches = LinkedHashMap<String, CachedInpaintPatch>()
 
     fun replaceText(
         frame: Mat,
         detectionResults: List<OcrService.DetectionResult>,
-        translatedTexts: List<String>
+        translatedTexts: List<String>,
+        reuseTrackedInpaint: Boolean = false
     ): Mat {
         if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) {
             return Mat()
@@ -114,26 +124,32 @@ class SceneTextReplacer(
 
             val baseItems = collectDrawItems(detectionResults, translatedTexts)
             if (baseItems.isEmpty()) {
-                stableTextColors.clear()
+                clearStableState()
                 return working
             }
-            retainOnlyActiveColorKeys(baseItems.mapTo(HashSet()) { it.stableKey })
+            val activeKeys = baseItems.mapTo(HashSet()) { it.stableKey }
+            retainOnlyActiveColorKeys(activeKeys)
+            retainOnlyActiveSizeKeys(activeKeys)
+            retainOnlyActiveInpaintPatchKeys(activeKeys)
 
-            val inpaintRegions = collectInpaintRegions(baseItems)
-            val inpaintMask = buildInpaintMask(working.cols(), working.rows(), inpaintRegions)
-            if (Core.countNonZero(inpaintMask) > 0) {
-                val inpainted = Mat()
-                Photo.inpaint(
-                    working,
-                    inpaintMask,
-                    inpainted,
-                    TELEA_INPAINT_RADIUS,
-                    Photo.INPAINT_TELEA
-                )
-                working.release()
-                working = inpainted
+            val useCachedInpaint = reuseTrackedInpaint && hasCachedInpaintForAll(baseItems)
+            if (!useCachedInpaint) {
+                val inpaintRegions = collectInpaintRegions(baseItems)
+                val inpaintMask = buildInpaintMask(working.cols(), working.rows(), inpaintRegions)
+                if (Core.countNonZero(inpaintMask) > 0) {
+                    val inpainted = Mat()
+                    Photo.inpaint(
+                        working,
+                        inpaintMask,
+                        inpainted,
+                        TELEA_INPAINT_RADIUS,
+                        Photo.INPAINT_TELEA
+                    )
+                    working.release()
+                    working = inpainted
+                }
+                inpaintMask.release()
             }
-            inpaintMask.release()
 
             val drawItems = applyTextColors(baseItems, originalBgr, working)
 
@@ -144,6 +160,12 @@ class SceneTextReplacer(
             val bitmap = getOrCreateBitmap(working.cols(), working.rows())
             Utils.matToBitmap(working, bitmap)
             val canvas = Canvas(bitmap)
+
+            if (useCachedInpaint) {
+                drawCachedInpaintPatches(canvas, drawItems, working.cols(), working.rows())
+            } else {
+                cacheInpaintPatches(bitmap, drawItems, working.cols(), working.rows())
+            }
 
             drawItems.forEach { item ->
                 drawTranslatedText(canvas, working.cols(), working.rows(), item)
@@ -191,7 +213,7 @@ class SceneTextReplacer(
             if (text.isEmpty()) return@forEachIndexed
             items.add(
                 DrawItem(
-                    stableKey = "$index:${text.hashCode()}",
+                    stableKey = result.stableId ?: "$index:${result.text.hashCode()}:${text.hashCode()}",
                     result = result,
                     box = box,
                     text = text
@@ -221,6 +243,63 @@ class SceneTextReplacer(
         return regions
     }
 
+    private fun hasCachedInpaintForAll(drawItems: List<DrawItem>): Boolean {
+        return drawItems.all { stableInpaintPatches.containsKey(it.stableKey) }
+    }
+
+    private fun cacheInpaintPatches(
+        inpaintedBitmap: Bitmap,
+        drawItems: List<DrawItem>,
+        maxWidth: Int,
+        maxHeight: Int
+    ) {
+        drawItems.forEach { item ->
+            val targetBox = computeInpaintTargetBox(item, maxWidth, maxHeight) ?: return@forEach
+            if (targetBox.width() <= 0 || targetBox.height() <= 0) return@forEach
+
+            val patchBitmap = try {
+                Bitmap.createBitmap(
+                    inpaintedBitmap,
+                    targetBox.left,
+                    targetBox.top,
+                    targetBox.width(),
+                    targetBox.height()
+                )
+            } catch (_: IllegalArgumentException) {
+                null
+            } ?: return@forEach
+
+            stableInpaintPatches.remove(item.stableKey)?.bitmap?.recycle()
+            stableInpaintPatches[item.stableKey] = CachedInpaintPatch(bitmap = patchBitmap)
+            trimInpaintPatchCache()
+        }
+    }
+
+    private fun drawCachedInpaintPatches(
+        canvas: Canvas,
+        drawItems: List<DrawItem>,
+        maxWidth: Int,
+        maxHeight: Int
+    ) {
+        drawItems.forEach { item ->
+            val patch = stableInpaintPatches[item.stableKey] ?: return@forEach
+            val targetBox = computeInpaintTargetBox(item, maxWidth, maxHeight) ?: return@forEach
+            if (targetBox.width() <= 0 || targetBox.height() <= 0) return@forEach
+            canvas.drawBitmap(patch.bitmap, null, targetBox, null)
+        }
+    }
+
+    private fun computeInpaintTargetBox(
+        item: DrawItem,
+        maxWidth: Int,
+        maxHeight: Int
+    ): android.graphics.Rect? {
+        val sourceBox = item.result.blockBoundingBox ?: item.box
+        val expanded = expandInpaintBox(sourceBox, maxWidth, maxHeight)
+        if (expanded.width() <= 0 || expanded.height() <= 0) return null
+        return expanded
+    }
+
     private fun buildRegionKey(
         box: android.graphics.Rect,
         cornerPoints: Array<android.graphics.Point>?
@@ -243,23 +322,19 @@ class SceneTextReplacer(
         val white = Scalar(255.0)
 
         regions.forEach { region ->
+            val expandedBox = expandInpaintBox(region.box, width, height)
             val polygon = toClampedPolygon(region.cornerPoints, width, height)
             if (polygon != null) {
                 Imgproc.fillConvexPoly(mask, polygon, white)
                 polygon.release()
-            } else {
-                val left = region.box.left.coerceAtLeast(0)
-                val top = region.box.top.coerceAtLeast(0)
-                val right = region.box.right.coerceAtMost(width)
-                val bottom = region.box.bottom.coerceAtMost(height)
-                Imgproc.rectangle(
-                    mask,
-                    Point(left.toDouble(), top.toDouble()),
-                    Point(right.toDouble(), bottom.toDouble()),
-                    white,
-                    -1
-                )
             }
+            Imgproc.rectangle(
+                mask,
+                Point(expandedBox.left.toDouble(), expandedBox.top.toDouble()),
+                Point(expandedBox.right.toDouble(), expandedBox.bottom.toDouble()),
+                white,
+                -1
+            )
         }
 
         val kernel = Imgproc.getStructuringElement(
@@ -269,6 +344,28 @@ class SceneTextReplacer(
         Imgproc.dilate(mask, mask, kernel)
         kernel.release()
         return mask
+    }
+
+    private fun expandInpaintBox(
+        box: android.graphics.Rect,
+        maxWidth: Int,
+        maxHeight: Int
+    ): android.graphics.Rect {
+        val padX = maxOf(
+            INPAINT_BOX_PAD_MIN_PX,
+            (box.width() * INPAINT_BOX_PAD_RATIO_X).roundToInt()
+        )
+        val padY = maxOf(
+            INPAINT_BOX_PAD_MIN_PX,
+            (box.height() * INPAINT_BOX_PAD_RATIO_Y).roundToInt()
+        )
+
+        return android.graphics.Rect(
+            (box.left - padX).coerceAtLeast(0),
+            (box.top - padY).coerceAtLeast(0),
+            (box.right + padX).coerceAtMost(maxWidth),
+            (box.bottom + padY).coerceAtMost(maxHeight)
+        )
     }
 
     private fun applyTextColors(
@@ -310,6 +407,48 @@ class SceneTextReplacer(
             stableTextColors.remove(firstKey)
         }
         return stabilized
+    }
+
+    private fun retainOnlyActiveSizeKeys(activeKeys: Set<String>) {
+        if (stableTextSizes.isEmpty()) return
+        val iterator = stableTextSizes.keys.iterator()
+        while (iterator.hasNext()) {
+            val key = iterator.next()
+            if (!activeKeys.contains(key)) {
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun stabilizeTextSize(
+        key: String,
+        candidate: Float
+    ): Float {
+        val stabilized = stableTextSizes[key] ?: candidate
+        stableTextSizes[key] = stabilized
+        while (stableTextSizes.size > COLOR_HISTORY_LIMIT) {
+            val firstKey = stableTextSizes.entries.firstOrNull()?.key ?: break
+            stableTextSizes.remove(firstKey)
+        }
+        return stabilized
+    }
+
+    private fun retainOnlyActiveInpaintPatchKeys(activeKeys: Set<String>) {
+        if (stableInpaintPatches.isEmpty()) return
+        val iterator = stableInpaintPatches.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            if (!activeKeys.contains(entry.key)) {
+                entry.value.bitmap.recycle()
+                iterator.remove()
+            }
+        }
+    }
+
+    fun clearStableState() {
+        stableTextColors.clear()
+        stableTextSizes.clear()
+        clearCachedInpaintPatches()
     }
 
     private fun toneBucket(color: Int): Int {
@@ -860,6 +999,18 @@ class SceneTextReplacer(
         return created
     }
 
+    private fun clearCachedInpaintPatches() {
+        stableInpaintPatches.values.forEach { it.bitmap.recycle() }
+        stableInpaintPatches.clear()
+    }
+
+    private fun trimInpaintPatchCache() {
+        while (stableInpaintPatches.size > COLOR_HISTORY_LIMIT) {
+            val firstKey = stableInpaintPatches.entries.firstOrNull()?.key ?: break
+            stableInpaintPatches.remove(firstKey)?.bitmap?.recycle()
+        }
+    }
+
     private fun drawTranslatedText(
         canvas: Canvas,
         maxWidth: Int,
@@ -893,6 +1044,7 @@ class SceneTextReplacer(
         }
 
         fontSize = (fontSize * GENERATED_TEXT_SCALE).coerceAtLeast(1f)
+        fontSize = stabilizeTextSize(item.stableKey, fontSize)
         textPaint.textSize = fontSize
         textPaint.getTextBounds(item.text, 0, item.text.length, textBounds)
 
