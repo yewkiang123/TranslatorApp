@@ -69,6 +69,7 @@ import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.ceil
@@ -181,7 +182,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private val downloadedLanguageCodes = mutableSetOf<String>()
     private val downloadingLanguageCodes = mutableSetOf<String>()
     private val languageCodeByDisplay = HashMap<String, String>()
-    private val translationCache = HashMap<String, String>()
+    private val translationCache = ConcurrentHashMap<String, String>()
     private lateinit var sourceSpinnerAdapter: SourceLanguageAdapter
     private lateinit var targetSpinnerAdapter: TargetLanguageAdapter
 
@@ -196,12 +197,14 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private var trackedResults: MutableList<OcrService.DetectionResult> = mutableListOf()
     private var trackedBaseResults: MutableList<OcrService.DetectionResult> = mutableListOf()
     private var trackedTranslations: MutableList<String> = mutableListOf()
+    private var trackingSessionId = 0L
     private var nextStableDetectionId = 1L
     private var trackingAnchorGray: Mat? = null
     private var trackingAccumulatedTransform = TrackingTransform()
     private var trackingMissCount = 0
     @Volatile private var cameraMotionStable = false
     @Volatile private var redetectAfterMotionStops = true
+    @Volatile private var replaceTrackingOnNextOcr = false
     private val trackIntervalMs = 45L
     private val redetectSettleDelayMs = 350L
     private val maxTrackingMisses = 8
@@ -331,10 +334,17 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             if (!freezeFrameMode) {
                 recordOcrEvent(event)
             }
+            val replaceTracking = !freezeFrameMode && replaceTrackingOnNextOcr
             if (event.results.isNotEmpty()) {
                 setNoTextDetected(false)
-                processOnInterval(event)
+                if (processOnInterval(event, replaceTracking)) {
+                    replaceTrackingOnNextOcr = false
+                }
             } else if (!freezeFrameMode) {
+                if (replaceTracking) {
+                    replaceTrackingOnNextOcr = false
+                    clearTrackingState()
+                }
                 showNoTextDetected()
             }
         }.launchIn(lifecycleScope)
@@ -350,6 +360,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                     }
                 } else {
                     cancelPendingRedetection()
+                    replaceTrackingOnNextOcr = false
                     hideOverlayOnly()
                     redetectAfterMotionStops = true
                     setNoTextDetected(false)
@@ -386,6 +397,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             if (!isActive || freezeFrameMode || !cameraMotionStable || !redetectAfterMotionStops) {
                 return@launch
             }
+            replaceTrackingOnNextOcr = hasActiveTrackingSession()
             ocrService.requestImmediateRefresh()
             lastProcessTime = 0L
             redetectAfterMotionStops = false
@@ -404,6 +416,12 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             detectingActive = false
         }
         renderProcessingIndicator(force = true)
+    }
+
+    private fun hasActiveTrackingSession(): Boolean {
+        return synchronized(trackingLock) {
+            trackedResults.isNotEmpty()
+        }
     }
 
     private fun resetRuntimeMetrics() {
@@ -750,10 +768,21 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                                     return@withContext null
                                 }
                             }
+                            if (rgba.empty() || rgba.cols() <= 0 || rgba.rows() <= 0) {
+                                safeMat.release()
+                                rgba.release()
+                                return@withContext null
+                            }
 
                             // Reuse bitmap to reduce GC + flicker
-                            val out = reusableBitmap?.takeIf { it.width == w && it.height == h }
-                                ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
+                            val out = reusableBitmap?.takeIf {
+                                it.width == rgba.cols() && it.height == rgba.rows()
+                            }
+                                ?: Bitmap.createBitmap(
+                                    rgba.cols(),
+                                    rgba.rows(),
+                                    Bitmap.Config.ARGB_8888
+                                ).also {
                                     reusableBitmap = it
                                 }
 
@@ -789,7 +818,13 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 }
                 val frame = FrameOcrRepository.snapshotLatestCameraFrame()
                 if (frame != null && !frame.empty()) {
-                    trackAndRender(frame)
+                    try {
+                        trackAndRender(frame)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Tracking loop failed", e)
+                        clearTrackingState(clearDisplayedOverlay = false)
+                        requestRedetectionAfterTrackingLoss()
+                    }
                 } else {
                     frame?.release()
                 }
@@ -837,6 +872,12 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             frame.rows()
         )
         val currentGray = toGray(frame)
+        if (currentGray.empty() || currentGray.cols() <= 0 || currentGray.rows() <= 0) {
+            currentGray.release()
+            requestRedetectionAfterTrackingLoss()
+            frame.release()
+            return
+        }
         val estimatedTransform = estimateTrackingTransform(
             prev = snapshot.anchorGray,
             current = currentGray,
@@ -947,14 +988,23 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun toGray(src: Mat): Mat {
-        val gray = Mat()
-        when (src.channels()) {
-            4 -> Imgproc.cvtColor(src, gray, Imgproc.COLOR_RGBA2GRAY)
-            3 -> Imgproc.cvtColor(src, gray, Imgproc.COLOR_BGR2GRAY)
-            1 -> src.copyTo(gray)
-            else -> Imgproc.cvtColor(src, gray, Imgproc.COLOR_BGR2GRAY)
+        if (src.empty() || src.cols() <= 0 || src.rows() <= 0) {
+            return Mat()
         }
-        return gray
+        val gray = Mat()
+        return try {
+            when (src.channels()) {
+                4 -> Imgproc.cvtColor(src, gray, Imgproc.COLOR_RGBA2GRAY)
+                3 -> Imgproc.cvtColor(src, gray, Imgproc.COLOR_BGR2GRAY)
+                1 -> src.copyTo(gray)
+                else -> Imgproc.cvtColor(src, gray, Imgproc.COLOR_BGR2GRAY)
+            }
+            gray
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to convert frame to grayscale", e)
+            gray.release()
+            Mat()
+        }
     }
 
     private fun estimateTrackingTransform(
@@ -963,171 +1013,181 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         referenceResults: List<OcrService.DetectionResult>,
         referencePivot: Point
     ): TrackingTransform? {
-        if (prev == null || prev.empty()) return null
+        if (prev == null || prev.empty() || current.empty()) return null
 
         val trackingRegion = computeTrackingRegion(prev.cols(), prev.rows(), referenceResults)
         val trackingScale = computeTrackingUpscale(referenceResults)
         val prevTracking = createTrackingInput(prev, trackingRegion, trackingScale)
         val currentTracking = createTrackingInput(current, trackingRegion, trackingScale)
         val points = MatOfPoint()
-        val trackingMask = buildTrackingMask(
-            prevTracking.cols(),
-            prevTracking.rows(),
-            referenceResults,
-            trackingRegion,
-            trackingScale
-        )
-        try {
-            if (trackingMask != null) {
-                Imgproc.goodFeaturesToTrack(
-                    prevTracking,
-                    points,
-                    trackingFeatureCount,
-                    trackingFeatureQualityLevel,
-                    trackingFeatureMinDistance,
-                    trackingMask
-                )
-            } else {
-                Imgproc.goodFeaturesToTrack(
-                    prevTracking,
-                    points,
-                    trackingFeatureCount,
-                    trackingFeatureQualityLevel,
-                    trackingFeatureMinDistance
-                )
+        return try {
+            if (prevTracking.empty() || currentTracking.empty()) {
+                return null
             }
-            if (points.empty() && trackingMask != null) {
-                Imgproc.goodFeaturesToTrack(
-                    prevTracking,
-                    points,
-                    trackingFeatureCount,
-                    trackingFeatureQualityLevel,
-                    trackingFeatureMinDistance
-                )
+
+            val trackingMask = buildTrackingMask(
+                prevTracking.cols(),
+                prevTracking.rows(),
+                referenceResults,
+                trackingRegion,
+                trackingScale
+            )
+            try {
+                if (trackingMask != null) {
+                    Imgproc.goodFeaturesToTrack(
+                        prevTracking,
+                        points,
+                        trackingFeatureCount,
+                        trackingFeatureQualityLevel,
+                        trackingFeatureMinDistance,
+                        trackingMask
+                    )
+                } else {
+                    Imgproc.goodFeaturesToTrack(
+                        prevTracking,
+                        points,
+                        trackingFeatureCount,
+                        trackingFeatureQualityLevel,
+                        trackingFeatureMinDistance
+                    )
+                }
+                if (points.empty() && trackingMask != null) {
+                    Imgproc.goodFeaturesToTrack(
+                        prevTracking,
+                        points,
+                        trackingFeatureCount,
+                        trackingFeatureQualityLevel,
+                        trackingFeatureMinDistance
+                    )
+                }
+            } finally {
+                trackingMask?.release()
             }
+
+            if (points.empty()) {
+                return estimateGlobalTranslationFallback(prev, current, referencePivot)
+            }
+
+            val prevPts = MatOfPoint2f(*points.toArray())
+            val nextPts = MatOfPoint2f()
+            val status = MatOfByte()
+            val err = MatOfFloat()
+            try {
+                Video.calcOpticalFlowPyrLK(
+                    prevTracking,
+                    currentTracking,
+                    prevPts,
+                    nextPts,
+                    status,
+                    err,
+                    trackingFlowWindowSize,
+                    trackingFlowMaxLevel,
+                    trackingFlowCriteria
+                )
+
+                val prevArr = prevPts.toArray()
+                val nextArr = nextPts.toArray()
+                val statusArr = status.toArray()
+                val prevValid = ArrayList<org.opencv.core.Point>(statusArr.size)
+                val nextValid = ArrayList<org.opencv.core.Point>(statusArr.size)
+
+                for (i in statusArr.indices) {
+                    if (statusArr[i].toInt() != 1) continue
+                    val from = trackingPointToFrame(prevArr[i], trackingRegion, trackingScale)
+                    val to = trackingPointToFrame(nextArr[i], trackingRegion, trackingScale)
+                    if (!from.x.isFinite() || !from.y.isFinite() || !to.x.isFinite() || !to.y.isFinite()) continue
+                    prevValid.add(from)
+                    nextValid.add(to)
+                }
+
+                if (prevValid.size < minTrackingTranslationPoints) {
+                    return estimateGlobalTranslationFallback(prev, current, referencePivot)
+                }
+
+                val motionStats = computeTrackingMotionStats(prevValid, nextValid)
+                if (prevValid.size < minTrackingValidPoints) {
+                    return estimateTranslationOnlyTransform(
+                        prevPoints = prevValid,
+                        nextPoints = nextValid,
+                        referencePivot = referencePivot,
+                        motionStats = motionStats
+                    )
+                }
+
+                val prevInliers = MatOfPoint2f(*prevValid.toTypedArray())
+                val nextInliers = MatOfPoint2f(*nextValid.toTypedArray())
+                val inlierMask = Mat()
+                try {
+                    val affine = Calib3d.estimateAffinePartial2D(
+                        prevInliers,
+                        nextInliers,
+                        inlierMask,
+                        Calib3d.RANSAC,
+                        3.0,
+                        2000L,
+                        0.99,
+                        10L
+                    )
+
+                    val inlierCount = if (!inlierMask.empty()) {
+                        Core.countNonZero(inlierMask)
+                    } else {
+                        prevValid.size
+                    }
+
+                    if (affine.empty() || affine.rows() < 2 || affine.cols() < 3) {
+                        affine.release()
+                        return estimateTranslationOnlyTransform(
+                            prevPoints = prevValid,
+                            nextPoints = nextValid,
+                            referencePivot = referencePivot,
+                            motionStats = motionStats
+                        ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
+                    }
+                    if (inlierCount < minTrackingAffineInliers) {
+                        affine.release()
+                        return estimateTranslationOnlyTransform(
+                            prevPoints = prevValid,
+                            nextPoints = nextValid,
+                            referencePivot = referencePivot,
+                            motionStats = motionStats
+                        ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
+                    }
+
+                    val rawTransform = TrackingTransform(
+                        m00 = affine.readDouble(0, 0) ?: 1.0,
+                        m01 = affine.readDouble(0, 1) ?: 0.0,
+                        m02 = affine.readDouble(0, 2) ?: 0.0,
+                        m10 = affine.readDouble(1, 0) ?: 0.0,
+                        m11 = affine.readDouble(1, 1) ?: 1.0,
+                        m12 = affine.readDouble(1, 2) ?: 0.0
+                    )
+                    affine.release()
+
+                    sanitizeTrackingTransform(
+                        raw = rawTransform,
+                        referencePivot = referencePivot,
+                        motionStats = motionStats
+                    ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
+                } finally {
+                    prevInliers.release()
+                    nextInliers.release()
+                    inlierMask.release()
+                }
+            } finally {
+                prevPts.release()
+                nextPts.release()
+                status.release()
+                err.release()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Tracking transform estimation failed", e)
+            null
         } finally {
-            trackingMask?.release()
-        }
-        if (points.empty()) {
             prevTracking.release()
             currentTracking.release()
             points.release()
-            return estimateGlobalTranslationFallback(prev, current, referencePivot)
         }
-
-        val prevPts = MatOfPoint2f(*points.toArray())
-        val nextPts = MatOfPoint2f()
-        val status = MatOfByte()
-        val err = MatOfFloat()
-
-        Video.calcOpticalFlowPyrLK(
-            prevTracking,
-            currentTracking,
-            prevPts,
-            nextPts,
-            status,
-            err,
-            trackingFlowWindowSize,
-            trackingFlowMaxLevel,
-            trackingFlowCriteria
-        )
-
-        val prevArr = prevPts.toArray()
-        val nextArr = nextPts.toArray()
-        val statusArr = status.toArray()
-
-        prevTracking.release()
-        currentTracking.release()
-        prevPts.release()
-        nextPts.release()
-        status.release()
-        err.release()
-        points.release()
-
-        val prevValid = ArrayList<org.opencv.core.Point>(statusArr.size)
-        val nextValid = ArrayList<org.opencv.core.Point>(statusArr.size)
-
-        for (i in statusArr.indices) {
-            if (statusArr[i].toInt() != 1) continue
-            val from = trackingPointToFrame(prevArr[i], trackingRegion, trackingScale)
-            val to = trackingPointToFrame(nextArr[i], trackingRegion, trackingScale)
-            if (!from.x.isFinite() || !from.y.isFinite() || !to.x.isFinite() || !to.y.isFinite()) continue
-            prevValid.add(from)
-            nextValid.add(to)
-        }
-
-        if (prevValid.size < minTrackingTranslationPoints) {
-            return estimateGlobalTranslationFallback(prev, current, referencePivot)
-        }
-
-        val motionStats = computeTrackingMotionStats(prevValid, nextValid)
-        if (prevValid.size < minTrackingValidPoints) {
-            return estimateTranslationOnlyTransform(
-                prevPoints = prevValid,
-                nextPoints = nextValid,
-                referencePivot = referencePivot,
-                motionStats = motionStats
-            )
-        }
-
-        val prevInliers = MatOfPoint2f(*prevValid.toTypedArray())
-        val nextInliers = MatOfPoint2f(*nextValid.toTypedArray())
-        val inlierMask = Mat()
-        val affine = Calib3d.estimateAffinePartial2D(
-            prevInliers,
-            nextInliers,
-            inlierMask,
-            Calib3d.RANSAC,
-            3.0,
-            2000L,
-            0.99,
-            10L
-        )
-
-        val inlierCount = if (!inlierMask.empty()) {
-            Core.countNonZero(inlierMask)
-        } else {
-            prevValid.size
-        }
-
-        prevInliers.release()
-        nextInliers.release()
-        inlierMask.release()
-
-        if (affine.empty() || affine.rows() < 2 || affine.cols() < 3) {
-            affine.release()
-            return estimateTranslationOnlyTransform(
-                prevPoints = prevValid,
-                nextPoints = nextValid,
-                referencePivot = referencePivot,
-                motionStats = motionStats
-            ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
-        }
-        if (inlierCount < minTrackingAffineInliers) {
-            affine.release()
-            return estimateTranslationOnlyTransform(
-                prevPoints = prevValid,
-                nextPoints = nextValid,
-                referencePivot = referencePivot,
-                motionStats = motionStats
-            ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
-        }
-
-        val rawTransform = TrackingTransform(
-            m00 = affine.readDouble(0, 0) ?: 1.0,
-            m01 = affine.readDouble(0, 1) ?: 0.0,
-            m02 = affine.readDouble(0, 2) ?: 0.0,
-            m10 = affine.readDouble(1, 0) ?: 0.0,
-            m11 = affine.readDouble(1, 1) ?: 1.0,
-            m12 = affine.readDouble(1, 2) ?: 0.0
-        )
-        affine.release()
-
-        return sanitizeTrackingTransform(
-            raw = rawTransform,
-            referencePivot = referencePivot,
-            motionStats = motionStats
-        ) ?: estimateGlobalTranslationFallback(prev, current, referencePivot)
     }
 
     private fun estimateGlobalTranslationFallback(
@@ -1135,68 +1195,73 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         current: Mat,
         referencePivot: Point
     ): TrackingTransform? {
+        if (prev.empty() || current.empty()) return null
         val points = MatOfPoint()
         try {
-            Imgproc.goodFeaturesToTrack(
-                prev,
-                points,
-                maxOf(trackingFeatureCount / 2, 120),
-                trackingFeatureQualityLevel,
-                trackingFeatureMinDistance
-            )
-            if (points.empty()) {
-                return null
-            }
-
-            val prevPts = MatOfPoint2f(*points.toArray())
-            val nextPts = MatOfPoint2f()
-            val status = MatOfByte()
-            val err = MatOfFloat()
-
             try {
-                Video.calcOpticalFlowPyrLK(
+                Imgproc.goodFeaturesToTrack(
                     prev,
-                    current,
-                    prevPts,
-                    nextPts,
-                    status,
-                    err,
-                    Size(51.0, 51.0),
-                    trackingFlowMaxLevel + 1,
-                    trackingFlowCriteria
+                    points,
+                    maxOf(trackingFeatureCount / 2, 120),
+                    trackingFeatureQualityLevel,
+                    trackingFeatureMinDistance
                 )
-
-                val prevArr = prevPts.toArray()
-                val nextArr = nextPts.toArray()
-                val statusArr = status.toArray()
-
-                val prevValid = ArrayList<Point>(statusArr.size)
-                val nextValid = ArrayList<Point>(statusArr.size)
-                for (i in statusArr.indices) {
-                    if (statusArr[i].toInt() != 1) continue
-                    val from = prevArr[i]
-                    val to = nextArr[i]
-                    if (!from.x.isFinite() || !from.y.isFinite() || !to.x.isFinite() || !to.y.isFinite()) continue
-                    prevValid.add(from)
-                    nextValid.add(to)
-                }
-
-                if (prevValid.size < minTrackingTranslationPoints) {
+                if (points.empty()) {
                     return null
                 }
 
-                val motionStats = computeTrackingMotionStats(prevValid, nextValid)
-                return estimateTranslationOnlyTransform(
-                    prevPoints = prevValid,
-                    nextPoints = nextValid,
-                    referencePivot = referencePivot,
-                    motionStats = motionStats
-                )
-            } finally {
-                prevPts.release()
-                nextPts.release()
-                status.release()
-                err.release()
+                val prevPts = MatOfPoint2f(*points.toArray())
+                val nextPts = MatOfPoint2f()
+                val status = MatOfByte()
+                val err = MatOfFloat()
+                try {
+                    Video.calcOpticalFlowPyrLK(
+                        prev,
+                        current,
+                        prevPts,
+                        nextPts,
+                        status,
+                        err,
+                        Size(51.0, 51.0),
+                        trackingFlowMaxLevel + 1,
+                        trackingFlowCriteria
+                    )
+
+                    val prevArr = prevPts.toArray()
+                    val nextArr = nextPts.toArray()
+                    val statusArr = status.toArray()
+
+                    val prevValid = ArrayList<Point>(statusArr.size)
+                    val nextValid = ArrayList<Point>(statusArr.size)
+                    for (i in statusArr.indices) {
+                        if (statusArr[i].toInt() != 1) continue
+                        val from = prevArr[i]
+                        val to = nextArr[i]
+                        if (!from.x.isFinite() || !from.y.isFinite() || !to.x.isFinite() || !to.y.isFinite()) continue
+                        prevValid.add(from)
+                        nextValid.add(to)
+                    }
+
+                    if (prevValid.size < minTrackingTranslationPoints) {
+                        return null
+                    }
+
+                    val motionStats = computeTrackingMotionStats(prevValid, nextValid)
+                    return estimateTranslationOnlyTransform(
+                        prevPoints = prevValid,
+                        nextPoints = nextValid,
+                        referencePivot = referencePivot,
+                        motionStats = motionStats
+                    )
+                } finally {
+                    prevPts.release()
+                    nextPts.release()
+                    status.release()
+                    err.release()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Global tracking fallback failed", e)
+                return null
             }
         } finally {
             points.release()
@@ -1738,9 +1803,10 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     private fun clearTrackingState(clearDisplayedOverlay: Boolean = true) {
         synchronized(trackingLock) {
-            trackedResults.clear()
-            trackedBaseResults.clear()
-            trackedTranslations.clear()
+            trackingSessionId++
+            trackedResults = mutableListOf()
+            trackedBaseResults = mutableListOf()
+            trackedTranslations = mutableListOf()
             trackingAnchorGray?.release()
             trackingAnchorGray = null
             trackingAccumulatedTransform = TrackingTransform()
@@ -1784,6 +1850,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
 
     private fun resetDetectionSession() {
         cancelPendingRedetection()
+        replaceTrackingOnNextOcr = false
         clearTrackingState()
         ocrService.resetSessionState()
         cameraMotionStable = false
@@ -1792,16 +1859,19 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         resetProcessingWork(keepDetecting = !freezeFrameMode && isOpenCvReady)
     }
 
-    private fun processOnInterval(event: OcrService.OcrDetectionEvent) {
-        if (freezeFrameMode) return
+    private fun processOnInterval(
+        event: OcrService.OcrDetectionEvent,
+        replaceTracking: Boolean = false
+    ): Boolean {
+        if (freezeFrameMode) return false
 
         val rawResults = event.results
         val now = System.currentTimeMillis()
-        if (now - lastProcessTime <= processInterval) return
+        if (!replaceTracking && now - lastProcessTime <= processInterval) return false
         lastProcessTime = now
         synchronized(trackingLock) {
-            if (trackedResults.isNotEmpty()) {
-                return
+            if (!replaceTracking && trackedResults.isNotEmpty()) {
+                return false
             }
         }
         val results = rawResults.map { result ->
@@ -1809,26 +1879,37 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         }
         val baseFrame = FrameOcrRepository.snapshotOcrSourceFrame(event.requestId)
             ?: FrameOcrRepository.snapshotLatestCameraFrame()
-            ?: return
+            ?: return false
         FrameOcrRepository.discardOcrSourceFrame(event.requestId)
         if (baseFrame.empty() || baseFrame.cols() <= 0 || baseFrame.rows() <= 0) {
             baseFrame.release()
-            return
+            return false
         }
 
-        val translatedTexts = MutableList(results.size) { "" }
         val anchorGray = toGray(baseFrame)
         baseFrame.release()
+        if (anchorGray.empty() || anchorGray.cols() <= 0 || anchorGray.rows() <= 0) {
+            anchorGray.release()
+            requestRedetectionAfterTrackingLoss()
+            return false
+        }
         val metricsSession = startMetricsSession(event)
 
-        synchronized(trackingLock) {
+        if (replaceTracking) {
+            hideOverlayOnly()
+            replacer.clearStableState()
+        }
+
+        val sessionId = synchronized(trackingLock) {
+            trackingSessionId++
             trackedBaseResults = results.map { it.copy() }.toMutableList()
             trackedResults = results.map { it.copy() }.toMutableList()
-            trackedTranslations = translatedTexts
+            trackedTranslations = MutableList(results.size) { "" }
             trackingAnchorGray?.release()
             trackingAnchorGray = anchorGray
             trackingAccumulatedTransform = TrackingTransform()
             trackingMissCount = 0
+            trackingSessionId
         }
         needsFreshInpaint = true
 
@@ -1840,13 +1921,13 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             val text = result.text
 
             translationCache[text]?.let { cached ->
-                applyTranslationResult(index, cached, translatedTexts)
+                applyTranslationResult(sessionId, index, cached)
                 return@forEachIndexed
             }
 
             val sourceLanguage = LanguageUiLogic.resolveSourceLanguage(selectedSourceCode, result.language)
             if (LanguageUiLogic.shouldBypassTranslation(sourceLanguage, targetLanguage, text)) {
-                applyTranslationResult(index, text, translatedTexts)
+                applyTranslationResult(sessionId, index, text)
                 return@forEachIndexed
             }
 
@@ -1870,7 +1951,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                                 val (index, originalText) = batch[i]
                                 val translated = translatedBatch[i]
                                 translationCache[originalText] = translated
-                                applyTranslationResult(index, translated, translatedTexts)
+                                applyTranslationResult(sessionId, index, translated)
                             }
                         } finally {
                             markTranslationBatchFinished(metricsSession)
@@ -1893,19 +1974,18 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
         if (pendingBatches.isEmpty()) {
             finalizeTranslationMetrics(metricsSession, event.ocrCompletedAtMs)
         }
+        return true
     }
 
     private fun applyTranslationResult(
+        sessionId: Long,
         index: Int,
-        text: String,
-        translatedTexts: MutableList<String>
+        text: String
     ) {
-        if (index >= translatedTexts.size) return
-        translatedTexts[index] = text
         synchronized(trackingLock) {
-            if (trackedTranslations === translatedTexts && index < trackedTranslations.size) {
-                trackedTranslations[index] = text
-            }
+            if (sessionId != trackingSessionId) return
+            if (index !in trackedTranslations.indices) return
+            trackedTranslations[index] = text
         }
     }
 
@@ -2227,6 +2307,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private fun startCameraWithOcr() {
         resetRuntimeMetrics()
         redetectAfterMotionStops = true
+        replaceTrackingOnNextOcr = false
         if (!isOpenCvReady) {
             cameraController.startCamera()
             setDetectingActive(false)
@@ -2572,8 +2653,11 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
                 1 -> Imgproc.cvtColor(source, rgba, Imgproc.COLOR_GRAY2RGBA)
                 else -> return null
             }
+            if (rgba.empty() || rgba.cols() <= 0 || rgba.rows() <= 0) {
+                return null
+            }
 
-            Bitmap.createBitmap(source.cols(), source.rows(), Bitmap.Config.ARGB_8888).also { bmp ->
+            Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888).also { bmp ->
                 org.opencv.android.Utils.matToBitmap(rgba, bmp)
             }
         } catch (e: Exception) {

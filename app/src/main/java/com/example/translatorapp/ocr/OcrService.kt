@@ -105,7 +105,7 @@ class OcrService : ImageAnalysis.Analyzer {
         val frameCapturedAtMs = SystemClock.elapsedRealtime()
         _analyzerFrames.tryEmit(frameCapturedAtMs)
 
-        if (!OpenCVInitializer.isReady()) {
+        if (!OpenCVInitializer.init()) {
             imageProxy.close()
             return
         }
@@ -126,6 +126,11 @@ class OcrService : ImageAnalysis.Analyzer {
         // Rotate Mat so it matches ML Kit bounding boxes
         val rotation = imageProxy.imageInfo.rotationDegrees
         fullMat = rotateMat(fullMat, rotation)
+        if (fullMat.empty() || fullMat.cols() <= 0 || fullMat.rows() <= 0) {
+            fullMat.release()
+            imageProxy.close()
+            return
+        }
         applyPendingSessionReset()
 
         // Always publish the latest raw camera frame
@@ -355,19 +360,33 @@ class OcrService : ImageAnalysis.Analyzer {
     }
 
     private fun updateMotionState(frame: Mat): Boolean {
+        if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) {
+            return false
+        }
         val now = SystemClock.elapsedRealtime()
 
         val gray = Mat()
-        when (frame.channels()) {
-            4 -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_RGBA2GRAY)
-            3 -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY)
-            1 -> frame.copyTo(gray)
-            else -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY)
-        }
-
         val small = Mat()
-        Imgproc.resize(gray, small, Size(160.0, 120.0))
-        gray.release()
+        try {
+            when (frame.channels()) {
+                4 -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_RGBA2GRAY)
+                3 -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY)
+                1 -> frame.copyTo(gray)
+                else -> Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY)
+            }
+            if (gray.empty()) {
+                return false
+            }
+            Imgproc.resize(gray, small, Size(160.0, 120.0))
+            if (small.empty()) {
+                return false
+            }
+        } catch (e: Exception) {
+            Log.e("OCR", "Failed to update motion state", e)
+            return false
+        } finally {
+            gray.release()
+        }
 
         val prev = prevGraySmall
         if (prev == null || prev.empty()) {
@@ -522,6 +541,7 @@ class OcrService : ImageAnalysis.Analyzer {
 @OptIn(ExperimentalGetImage::class)
 fun ImageProxy.toMat(): Mat? {
     if (this.format != android.graphics.ImageFormat.YUV_420_888) return null
+    if (!OpenCVInitializer.isReady()) return null
 
     val nv21 = yuv420ToNv21(this)
     val yuv = Mat()

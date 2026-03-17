@@ -87,6 +87,7 @@ class SceneTextReplacer(
     }
 
     private var reusableBitmap: Bitmap? = null
+    private val stateLock = Any()
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
         this.typeface = this@SceneTextReplacer.typeface
@@ -107,83 +108,85 @@ class SceneTextReplacer(
         translatedTexts: List<String>,
         reuseTrackedInpaint: Boolean = false
     ): Mat {
-        if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) {
-            return Mat()
-        }
-
-        var working: Mat? = null
-        var originalBgr: Mat? = null
-
-        try {
-            working = ensureBgr(frame)
-            if (working.empty() || working.cols() <= 0 || working.rows() <= 0) {
-                working.release()
-                return Mat()
+        return synchronized(stateLock) {
+            if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) {
+                return@synchronized Mat()
             }
-            originalBgr = working.clone()
 
-            val baseItems = collectDrawItems(detectionResults, translatedTexts)
-            if (baseItems.isEmpty()) {
-                clearStableState()
-                return working
-            }
-            val activeKeys = baseItems.mapTo(HashSet()) { it.stableKey }
-            retainOnlyActiveColorKeys(activeKeys)
-            retainOnlyActiveSizeKeys(activeKeys)
-            retainOnlyActiveInpaintPatchKeys(activeKeys)
+            var working: Mat? = null
+            var originalBgr: Mat? = null
 
-            val useCachedInpaint = reuseTrackedInpaint && hasCachedInpaintForAll(baseItems)
-            if (!useCachedInpaint) {
-                val inpaintRegions = collectInpaintRegions(baseItems)
-                val inpaintMask = buildInpaintMask(working.cols(), working.rows(), inpaintRegions)
-                if (Core.countNonZero(inpaintMask) > 0) {
-                    val inpainted = Mat()
-                    Photo.inpaint(
-                        working,
-                        inpaintMask,
-                        inpainted,
-                        TELEA_INPAINT_RADIUS,
-                        Photo.INPAINT_TELEA
-                    )
+            try {
+                working = ensureBgr(frame)
+                if (working.empty() || working.cols() <= 0 || working.rows() <= 0) {
                     working.release()
-                    working = inpainted
+                    return@synchronized Mat()
                 }
-                inpaintMask.release()
+                originalBgr = working.clone()
+
+                val baseItems = collectDrawItems(detectionResults, translatedTexts)
+                if (baseItems.isEmpty()) {
+                    clearStableState()
+                    return@synchronized working
+                }
+                val activeKeys = baseItems.mapTo(HashSet()) { it.stableKey }
+                retainOnlyActiveColorKeys(activeKeys)
+                retainOnlyActiveSizeKeys(activeKeys)
+                retainOnlyActiveInpaintPatchKeys(activeKeys)
+
+                val useCachedInpaint = reuseTrackedInpaint && hasCachedInpaintForAll(baseItems)
+                if (!useCachedInpaint) {
+                    val inpaintRegions = collectInpaintRegions(baseItems)
+                    val inpaintMask = buildInpaintMask(working.cols(), working.rows(), inpaintRegions)
+                    if (Core.countNonZero(inpaintMask) > 0) {
+                        val inpainted = Mat()
+                        Photo.inpaint(
+                            working,
+                            inpaintMask,
+                            inpainted,
+                            TELEA_INPAINT_RADIUS,
+                            Photo.INPAINT_TELEA
+                        )
+                        working.release()
+                        working = inpainted
+                    }
+                    inpaintMask.release()
+                }
+
+                val drawItems = applyTextColors(baseItems, originalBgr, working)
+
+                Imgproc.cvtColor(working, working, Imgproc.COLOR_BGR2RGB)
+                if (working.empty()) {
+                    return@synchronized Mat()
+                }
+                val bitmap = getOrCreateBitmap(working.cols(), working.rows())
+                Utils.matToBitmap(working, bitmap)
+                val canvas = Canvas(bitmap)
+
+                if (useCachedInpaint) {
+                    drawCachedInpaintPatches(canvas, drawItems, working.cols(), working.rows())
+                } else {
+                    cacheInpaintPatches(bitmap, drawItems, working.cols(), working.rows())
+                }
+
+                drawItems.forEach { item ->
+                    drawTranslatedText(canvas, working.cols(), working.rows(), item)
+                }
+
+                Utils.bitmapToMat(bitmap, working)
+                Imgproc.cvtColor(working, working, Imgproc.COLOR_RGB2BGR)
+            } catch (e: Exception) {
+                Log.e(TAG, "SceneTextReplacer failed", e)
+            } finally {
+                originalBgr?.release()
             }
 
-            val drawItems = applyTextColors(baseItems, originalBgr, working)
-
-            Imgproc.cvtColor(working, working, Imgproc.COLOR_BGR2RGB)
-            if (working.empty()) {
-                return Mat()
-            }
-            val bitmap = getOrCreateBitmap(working.cols(), working.rows())
-            Utils.matToBitmap(working, bitmap)
-            val canvas = Canvas(bitmap)
-
-            if (useCachedInpaint) {
-                drawCachedInpaintPatches(canvas, drawItems, working.cols(), working.rows())
+            if (working != null && !working.empty()) {
+                working
             } else {
-                cacheInpaintPatches(bitmap, drawItems, working.cols(), working.rows())
+                working?.release()
+                Mat()
             }
-
-            drawItems.forEach { item ->
-                drawTranslatedText(canvas, working.cols(), working.rows(), item)
-            }
-
-            Utils.bitmapToMat(bitmap, working)
-            Imgproc.cvtColor(working, working, Imgproc.COLOR_RGB2BGR)
-        } catch (e: Exception) {
-            Log.e(TAG, "SceneTextReplacer failed", e)
-        } finally {
-            originalBgr?.release()
-        }
-
-        return if (working != null && !working.empty()) {
-            working
-        } else {
-            working?.release()
-            Mat()
         }
     }
 
@@ -446,9 +449,11 @@ class SceneTextReplacer(
     }
 
     fun clearStableState() {
-        stableTextColors.clear()
-        stableTextSizes.clear()
-        clearCachedInpaintPatches()
+        synchronized(stateLock) {
+            stableTextColors.clear()
+            stableTextSizes.clear()
+            clearCachedInpaintPatches()
+        }
     }
 
     private fun toneBucket(color: Int): Int {

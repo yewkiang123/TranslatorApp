@@ -91,6 +91,7 @@
             android:layout_gravity="bottom|start"
             android:layout_marginStart="14dp"
             android:layout_marginBottom="14dp"
+            android:visibility="gone"
             app:cardBackgroundColor="#EAF2FF"
             app:cardCornerRadius="16dp"
             app:cardElevation="0dp"

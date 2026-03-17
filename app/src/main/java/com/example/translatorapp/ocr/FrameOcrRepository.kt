@@ -33,6 +33,7 @@ object FrameOcrRepository {
      * Update the current frame
      */
     fun updateFrame(frame: Mat) {
+        if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) return
         synchronized(frameLock) {
             _currentFrame.value?.release()
             _currentFrame.value = frame.clone()
@@ -43,6 +44,7 @@ object FrameOcrRepository {
      * Update the latest raw camera frame
      */
     fun updateLatestCameraFrame(frame: Mat) {
+        if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) return
         synchronized(frameLock) {
             _latestCameraFrame.value?.release()
             _latestCameraFrame.value = frame.clone()
@@ -58,7 +60,7 @@ object FrameOcrRepository {
     fun snapshotCurrentFrame(): Mat? {
         synchronized(frameLock) {
             val frame = _currentFrame.value ?: return null
-            if (frame.empty()) return null
+            if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) return null
             return frame.clone()
         }
     }
@@ -66,7 +68,7 @@ object FrameOcrRepository {
     fun snapshotLatestCameraFrame(): Mat? {
         synchronized(frameLock) {
             val frame = _latestCameraFrame.value ?: return null
-            if (frame.empty()) return null
+            if (frame.empty() || frame.cols() <= 0 || frame.rows() <= 0) return null
             return frame.clone()
         }
     }
