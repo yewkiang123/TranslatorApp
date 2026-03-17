@@ -29,9 +29,9 @@ class SceneTextReplacer(
         private const val TAG = "SceneTextReplacer"
         private const val TELEA_INPAINT_RADIUS = 4.0
         private const val INPAINT_MASK_DILATE_SIZE = 5
-        private const val INPAINT_BOX_PAD_RATIO_X = 0.14
-        private const val INPAINT_BOX_PAD_RATIO_Y = 0.28
-        private const val INPAINT_BOX_PAD_MIN_PX = 6
+        private const val INPAINT_BOX_PAD_RATIO_X = 0.18
+        private const val INPAINT_BOX_PAD_RATIO_Y = 0.34
+        private const val INPAINT_BOX_PAD_MIN_PX = 8
         private const val GENERATED_TEXT_SCALE = 0.8f
         private const val ANGLE_SNAP_DEGREES = 1.25f
         private const val COLOR_SWITCH_HYSTERESIS = 36.0
