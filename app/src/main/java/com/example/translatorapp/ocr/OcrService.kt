@@ -516,10 +516,6 @@ class OcrService : ImageAnalysis.Analyzer {
         src.release()
         return dst
     }
-    fun resetCache() {
-        seenDetections.clear()
-    }
-
     fun requestImmediateRefresh() {
         ocrArmed = true
         ocrFramesProcessed = 0
